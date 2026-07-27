@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-tutorial-custom-backend"
+version = "0.1.0"
+description = "Tutorial: a custom Triton attention backend plugin for vLLM"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["custom_backend", "tests"]
+
+# 关键：把插件注册进 vLLM 的 general_plugins 组。
+# vLLM 启动时（所有进程）会调用 custom_backend.plugin:register，
+# 从而把 AttentionBackendEnum.CUSTOM 指向我们的后端类。
+[project.entry-points."vllm.general_plugins"]
+custom_triton = "custom_backend.plugin:register"
