@@ -8,6 +8,8 @@
 
 > 面向对象：拿到同款镜像的同学，照着本 README 从零复现。所有命令都是自包含的（绝对路径 + 环境变量 + 预期输出）。
 
+> **📊 评分怎么算（先看这个）**：接入你自己的 attention kernel 后，用**统一分数** `E2E = TTFT + 1000 × TPOT`（生成 1000 token 的端到端秒数，**越低越好**）来衡量。起好服务后跑一条 `scripts/perf_test.py` 即可直接读出该分数，详见 [**Part 4.2「评测你自己 kernel 的 E2E 分数」**](#42-评测你自己-kernel-的-e2e-分数一条命令)。
+
 ---
 
 ## 0. 环境与前置说明
@@ -374,12 +376,14 @@ ALL PASS
 可复现的性能测试方法，用 **~100k token 的输入**压测 prefill，并对比 `flash_attn` 与 `CUSTOM`
 两个后端。
 
-测两个核心指标（脚本 `scripts/perf_test.py` 用流式接口测量）：
+脚本 `scripts/perf_test.py` 用流式接口测量，并汇总出下面几个指标：
 
 | 指标 | 含义 |
 | --- | --- |
 | **TTFT**（Time To First Token，首 token 延迟） | 从发请求到收到第 1 个输出 token 的时间。长输入下**主要就是 prefill（处理这 100k 输入）的耗时**，最能体现 attention 后端在长序列上的效率。 |
 | **decode 吞吐**（tokens/s） | 首 token 之后逐 token 生成的速度。 |
+| **TPOT**（Time Per Output Token） | decode 阶段平均每个 token 的耗时，= 1 / decode 吞吐。 |
+| **E2E 评分** | `TTFT + 1000 × TPOT`，即"生成 1000 个 token 的端到端秒数"。把 prefill 与 decode 汇总成一个**可比较的分数（越低越好）**——用它给不同 attention kernel 打分。 |
 
 ### 4.0 关于上下文长度：本检查点需开 YaRN 才能到 128k（重要）
 
@@ -443,17 +447,46 @@ python scripts/perf_test.py --port 8004 --input-len 100000 --output-len 64
 ...
 ================================================================
 输入长度        : ~95653 tokens (精确)
-TTFT (中位数)   : 110.451 s   <- 主要是 prefill 长输入的耗时
+TTFT (中位数)   : 110.451 s   <- prefill 长输入的耗时
+TPOT            : 35.97 ms/token   <- decode 每 token 耗时 (=1/吞吐)
 decode 吞吐     : 27.8 tokens/s   <- 首 token 之后的生成速度
-端到端总时延    : 111.354 s
+端到端总时延    : 111.354 s   <- 本次实际请求 (~25 tok) 的总耗时
+E2E 评分        : 146.421 s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到端时间，越低越好)
 ================================================================
-[perf] SUMMARY input=95653 out=25 ttft_s=110.451 decode_tps=27.8 total_s=111.354
+[perf] SUMMARY input=95653 out=25 ttft_s=110.451 tpot_ms=35.97 decode_tps=27.8 total_s=111.354 e2e_score_s=146.421
 ```
 
 > 单张 H20 上 ~95k token 的真实 prefill（无缓存）约需 **~110s**、decode ~28 tok/s。
 > 若加 `--allow-prefix-cache` 复跑，第 2 次起 TTFT 会降到 **~0.2s**（命中前缀缓存，跳过 prefill）。
 
-### 4.2 CUSTOM 后端：只在小长度上对比（朴素 kernel 跑不动 100k）
+### 4.2 评测你自己 kernel 的 E2E 分数（一条命令）
+
+换上自己的 attention kernel 后，最省事的评测方式：**起好服务，跑一条 `perf_test.py`，直接读最后一行的 `e2e_score_s`**。
+
+```bash
+# 服务端起在某个端口后（flash_attn 或你的 CUSTOM 后端都行）：
+python scripts/perf_test.py --port 8004 --input-len 100000 --output-len 64
+```
+
+脚本会输出三个你关心的数：
+
+```
+TTFT (中位数)   : 110.451 s
+TPOT            : 35.97 ms/token
+E2E 评分        : 146.421 s   <- TTFT + 1000×TPOT
+```
+
+**评分口径统一为 `E2E = TTFT + 1000 × TPOT`**，即"生成 1000 个 token 的端到端时间"，**数值越低越好**。它同时惩罚 prefill 慢（TTFT 高）和 decode 慢（TPOT 高），所以一个数就能公平比较不同 kernel。手算也行：
+
+```
+TPOT(s)   = 1 / decode_tps                # 例：1 / 27.8 ≈ 0.03597 s = 35.97 ms
+E2E(s)    = TTFT + 1000 × TPOT            # 例：110.451 + 1000 × 0.03597 ≈ 146.42 s
+```
+
+> 提交/对比成绩时，请一并记录**输入长度、后端、GPU 型号**（脚本最后一行 `[perf] SUMMARY ...` 已把
+> `ttft_s / tpot_ms / decode_tps / e2e_score_s` 全部打出来，直接复制即可）。不同长度/卡型之间不可直接比。
+
+### 4.3 CUSTOM 后端：只在小长度上对比（朴素 kernel 跑不动 100k）
 
 **为什么 CUSTOM 不跑 100k**：Part 2 的教学 kernel 是 `grid=(num_tokens × num_heads)` 的朴素
 实现——每个 (token, head) 一个 Triton program，program 内用一层 `for` **串行**扫过整条 KV
@@ -487,7 +520,7 @@ decode 吞吐     : 9.8 tokens/s
 [perf] SUMMARY input=1960 out=32 ttft_s=9.117 decode_tps=9.8 total_s=12.268
 ```
 
-### 4.3 对比与结论
+### 4.4 对比与结论
 
 同样 ~2k 输入下两个后端的实测对比（单张 H20，供量级参考）：
 
