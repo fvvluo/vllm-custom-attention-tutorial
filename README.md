@@ -8,7 +8,7 @@
 
 > 面向对象：拿到同款镜像的同学，照着本 README 从零复现。所有命令都是自包含的（绝对路径 + 环境变量 + 预期输出）。
 
-> **📊 评分怎么算（先看这个）**：接入你自己的 attention kernel 后，用**统一分数** `E2E = TTFT + 1000 × TPOT`（生成 1000 token 的端到端秒数，**越低越好**）来衡量。起好服务后跑一条 `scripts/perf_test.py` 即可直接读出该分数，详见 [**Part 4.2「评测你自己 kernel 的 E2E 分数」**](#42-评测你自己-kernel-的-e2e-分数一条命令)。
+> **📊 评分怎么算（先看这个）**：接入你自己的 attention kernel 后，用**统一分数** `E2E = TTFT + 1000 × TPOT`（生成 1000 token 的端到端秒数，**越低越好**）来衡量。本教程 flash_attn 的 **baseline = `147s`**（单张 H20，~95k 输入实测），你的**加速比 = `147s / 你的 E2E 用时`**。起好服务后跑一条 `scripts/perf_test.py` 即可直接读出分数，详见 [**Part 4.2「评测你自己 kernel 的 E2E 分数」**](#42-评测你自己-kernel-的-e2e-分数一条命令)。
 
 ---
 
@@ -417,13 +417,15 @@ rope_scaling            = None
 ```bash
 cd /dockerdata/landojiang/vllm_tutorial
 HF_OVERRIDES='{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":40960},"max_position_embeddings":163840}' \
-MAX_LEN=102400 GPU_MEM_UTIL=0.97 GPU=4 PORT=8004 \
+MAX_LEN=102400 GPU_MEM_UTIL=0.94 GPU=4 PORT=8004 \
 bash scripts/serve_qwen3_flashattn.sh
 ```
 
 > 单张 H20（97GB）装完 32B 权重（~61GB）后，KV cache 余量有限：`gpu-memory-utilization=0.92`
-> 时只够 ~92k token，`--max-model-len 110000` 会报 KV cache 不足。这里用 `0.97` + `102400`
-> 恰好放下 100k 输入 + 少量输出。若仍报显存不足，降 `MAX_LEN` 或换更空闲的卡。
+> 时只够 ~92k token，`--max-model-len 110000` 会报 KV cache 不足。这里用 `0.94` + `102400`
+> 实测能放下 100k 输入 + 少量输出：KV cache ~106k token（>102400，够用），prefill 峰值也不触发 OOM。
+> （`0.97` 也能跑通，但 prefill 峰值时显存只剩 ~440MB、出现过一次非致命 OOM 重试贴着天花板跑；
+> 推荐用 `0.94` 留出余量更稳。）若仍报显存不足，降 `MAX_LEN` 或换更空闲的卡。
 
 在**第二个终端**跑性能测试：
 
@@ -436,27 +438,42 @@ python scripts/perf_test.py --port 8004 --input-len 100000 --output-len 64
 > 这样测到的 TTFT 才是**真实的长输入 prefill 耗时**。如果不加唯一前缀（`--allow-prefix-cache`），
 > 第二次起相同 prompt 会命中缓存、跳过 prefill，TTFT 会假性降到亚秒级（缓存收益本身也值得一看）。
 
-**预期输出**（单张 H20 实测；数值随卡型/负载/vLLM 版本浮动，仅作量级参考）：
+**实测输出（本教程 baseline，单张 H20 / `GPU_MEM_UTIL=0.94`；数值随卡型/负载/vLLM 版本浮动）**：
 
 ```
 [perf] 服务: http://127.0.0.1:8004/v1  模型: qwen3-32b
 [perf] 目标输入长度: 100000 tokens  生成上限: 64 tokens
 [perf] 实际输入长度(精确): ~95653 tokens
 [perf] 预热 1/1 ...
-[perf] 第 1/3 次: TTFT=110.451s  decode=27.8 tok/s  total=111.354s  out=25 tok
-...
+[perf] 第 1/3 次: TTFT=111.390s  decode=28.2 tok/s  total=112.138s  out=21 tok
+[perf] 第 2/3 次: TTFT=111.411s  decode=27.4 tok/s  total=113.236s  out=50 tok
+[perf] 第 3/3 次: TTFT=111.411s  decode=28.1 tok/s  total=112.269s  out=24 tok
 ================================================================
 输入长度        : ~95653 tokens (精确)
-TTFT (中位数)   : 110.451 s   <- prefill 长输入的耗时
-TPOT            : 35.97 ms/token   <- decode 每 token 耗时 (=1/吞吐)
-decode 吞吐     : 27.8 tokens/s   <- 首 token 之后的生成速度
-端到端总时延    : 111.354 s   <- 本次实际请求 (~25 tok) 的总耗时
-E2E 评分        : 146.421 s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到端时间，越低越好)
+生成长度        : 24 tokens (上限 64)
+TTFT (中位数)   : 111.411 s   <- prefill 长输入的耗时
+TPOT            : 35.57 ms/token   <- decode 每 token 耗时 (=1/吞吐)
+decode 吞吐     : 28.1 tokens/s   <- 首 token 之后的生成速度
+端到端总时延    : 112.269 s   <- 本次实际请求 (~24 tok) 的总耗时
+E2E 评分        : 146.981 s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到端时间，越低越好)
 ================================================================
-[perf] SUMMARY input=95653 out=25 ttft_s=110.451 tpot_ms=35.97 decode_tps=27.8 total_s=111.354 e2e_score_s=146.421
+[perf] SUMMARY input=95653 out=24 ttft_s=111.411 tpot_ms=35.57 decode_tps=28.1 total_s=112.269 e2e_score_s=146.981
 ```
 
-> 单张 H20 上 ~95k token 的真实 prefill（无缓存）约需 **~110s**、decode ~28 tok/s。
+> **为什么是 ~95653 而不是 100000？** `--input-len 100000` 是**目标**长度；脚本用 Qwen3 tokenizer
+> 把重复文本编码→截断到 10 万 token→再 `decode` 回文本，而 decode 后**重新编码**时 token 边界会重新
+> 合并（非无损），实际落到 ~95653。脚本诚实地打印这个**重编码后的真实值**并用它计分。
+>
+> **这个长度对所有人是统一的、可复现的**：filler 文本在脚本里写死、tokenizer 都是同一个
+> `/dockerdata/models/Qwen3-32B`、截断/编解码都是确定性操作——所以只要大家都用**默认的
+> `--input-len 100000` 跑同一个脚本**，实际输入就都是 ~95653，不会出现"他 95k、他 98k、他 90k"。
+> 唯一会变的是有人手动改了 `--input-len`（那样就不可比了，见 4.2 的提交要求）。
+
+> 📌 **本教程 baseline（flash_attn，单张 H20，~95k 输入实测）：E2E ≈ `147s`**（= TTFT 111.4s + 1000×TPOT 35.57ms）。上面即为实测结果。
+>
+> **你的加速比 = `147s / 你的 E2E 用时`**（>1 即比 baseline 快）。换上自己的 kernel 后跑同样命令，用输出的 `e2e_score_s` 代入即可。
+
+> 补充：单张 H20 上 ~95k token 的真实 prefill（无缓存）就是上面的 TTFT ~111s、decode ~28 tok/s。
 > 若加 `--allow-prefix-cache` 复跑，第 2 次起 TTFT 会降到 **~0.2s**（命中前缀缓存，跳过 prefill）。
 
 ### 4.2 评测你自己 kernel 的 E2E 分数（一条命令）
@@ -468,23 +485,25 @@ E2E 评分        : 146.421 s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到�
 python scripts/perf_test.py --port 8004 --input-len 100000 --output-len 64
 ```
 
-脚本会输出三个你关心的数：
+脚本会输出三个你关心的数（下面是 flash_attn baseline 的值）：
 
 ```
-TTFT (中位数)   : 110.451 s
-TPOT            : 35.97 ms/token
-E2E 评分        : 146.421 s   <- TTFT + 1000×TPOT
+TTFT (中位数)   : 111.411 s
+TPOT            : 35.57 ms/token
+E2E 评分        : 146.981 s   <- TTFT + 1000×TPOT
 ```
 
 **评分口径统一为 `E2E = TTFT + 1000 × TPOT`**，即"生成 1000 个 token 的端到端时间"，**数值越低越好**。它同时惩罚 prefill 慢（TTFT 高）和 decode 慢（TPOT 高），所以一个数就能公平比较不同 kernel。手算也行：
 
 ```
-TPOT(s)   = 1 / decode_tps                # 例：1 / 27.8 ≈ 0.03597 s = 35.97 ms
-E2E(s)    = TTFT + 1000 × TPOT            # 例：110.451 + 1000 × 0.03597 ≈ 146.42 s
+TPOT(s)   = 1 / decode_tps                # 例：1 / 28.1 ≈ 0.03557 s = 35.57 ms
+E2E(s)    = TTFT + 1000 × TPOT            # 例：111.411 + 1000 × 0.03557 ≈ 146.98 s
 ```
 
-> 提交/对比成绩时，请一并记录**输入长度、后端、GPU 型号**（脚本最后一行 `[perf] SUMMARY ...` 已把
-> `ttft_s / tpot_ms / decode_tps / e2e_score_s` 全部打出来，直接复制即可）。不同长度/卡型之间不可直接比。
+> **成绩可比的前提（重要）**：必须用**默认参数**跑 —— `--input-len 100000`（实际 ~95653 token，人人一致）、
+> `--output-len 64`、不加 `--allow-prefix-cache`。改了输入长度或开了前缀缓存，分数就**不可与 baseline 或他人比较**。
+> 提交成绩时请连同脚本最后一行 `[perf] SUMMARY ...`（含 `input= / ttft_s / tpot_ms / decode_tps / e2e_score_s`）
+> 与 **GPU 型号**一起给出；不同卡型之间也不可直接比（baseline 是单张 H20）。
 
 ### 4.3 CUSTOM 后端：只在小长度上对比（朴素 kernel 跑不动 100k）
 
