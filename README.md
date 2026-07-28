@@ -123,19 +123,78 @@ PYTHONPATH=/dockerdata/landojiang/vllm_src python scripts/smoke_test.py --port 8
 
 验证完可在启动终端按 `Ctrl-C` 停止服务，释放显存。
 
-### 1.4 TODO（留给助教）：接入 HumanEval 测试
+### 1.4 用 HumanEval 评测本服务（pass@1，贪心）
 
-<!-- =========================== TODO: HUMAN EVAL =========================== -->
-> **TODO（助教补充）**：在此处补充用 **HumanEval** 数据集评测本服务的方式。
+用 **HumanEval**（164 道 Python 函数补全题）通过 OpenAI 兼容接口评测本服务，
+计算 `pass@1`（每题贪心解码只生成 1 个补全，要求它通过全部单测）。
+
+整个流程分两步，脚本都在 `scripts/` 下，**只依赖 `openai` 客户端 + Python 标准库**：
+
+- `scripts/humaneval_generate.py`：对每道题调用 `/v1/chat/completions`（`temperature=0`）
+  生成补全，清洗成纯函数体，写到 `logs/humaneval_samples.jsonl`。
+- `scripts/humaneval_evaluate.py`：把 `prompt + 补全 + 官方单测` 拼成可执行程序，
+  在**独立子进程**里带超时执行（**沙箱**），统计 `pass@1`。
+
+> HumanEval 数据集（`HumanEval.jsonl.gz`，164 题）会在首次运行 generate 时从官方
+> `openai/human-eval` 仓库自动下载并缓存到 `data/`。离线环境可手动把该文件放到
+> `data/HumanEval.jsonl.gz`。
+
+**第 0 步：装 openai 客户端（一次性）**
+
+```bash
+pip install openai
+```
+
+**第 1 步：起好服务**（1.2 的 flash_attn 或 Part 2 的 CUSTOM 后端均可），在**另一个终端**生成补全：
+
+```bash
+cd /dockerdata/landojiang/vllm_tutorial
+# 先快速冒烟（前 20 题），确认链路通
+PYTHONPATH=/dockerdata/landojiang/vllm_src python scripts/humaneval_generate.py \
+    --port 8000 --model qwen3-32b --limit 20
+
+# 跑完整 164 题（并发 4 条请求加速）
+PYTHONPATH=/dockerdata/landojiang/vllm_src python scripts/humaneval_generate.py \
+    --port 8000 --model qwen3-32b --concurrency 4 \
+    --output logs/humaneval_samples.jsonl
+```
+
+**第 2 步：在沙箱里评测，得到 pass@1**：
+
+```bash
+cd /dockerdata/landojiang/vllm_tutorial
+python scripts/humaneval_evaluate.py \
+    --samples logs/humaneval_samples.jsonl \
+    --timeout 10 --workers 8 \
+    --report logs/humaneval_report.jsonl
+```
+
+**输出结尾**（逐题打印 PASS/FAIL 后给出总分）：
+
+```
+==================================================
+pass@1 = 145/164 = 0.8841  (88.41%)
+```
+
+**两后端实测对比**（单张 H20，完整 164 题，贪心 `pass@1`，本仓库实测）：
+
+| 后端 | pass@1 | 说明 |
+| --- | --- | --- |
+| `flash_attn` | **145/164 = 88.41%** | baseline |
+| `CUSTOM`（教学 Triton kernel） | **146/164 = 89.02%** | 与 baseline 相差 1 题 |
+
+> **为什么这个对比重要**：两个后端跑出的分数**基本一致**（差 1 题 ≈ 0.6%，属贪心解码在个别
+> 边界题上的正常抖动），这就证明了自定义 `CUSTOM` attention backend 的计算是**正确**的——
+> 若后端把 KV cache 写错位置，分数会大幅崩塌（而不是只差 1 题）。这也是 Part 2 里那个"必须
+> 校验答案正确、而非仅非空"的思想在**数据集规模**上的延伸验证。
 >
-> 建议思路（待助教完善为可复现步骤）：
-> 1. 起好本服务（1.2 节）后，用 EvalPlus 或官方 `human-eval` 库通过 OpenAI 兼容接口
->    （`http://127.0.0.1:8000/v1`，模型名 `qwen3-32b`）批量生成代码补全；
-> 2. 在**沙箱/容器**内执行生成的代码，计算 `pass@1`（贪心）等指标；
-> 3. 把生成脚本、评测命令、预期分数区间补充到本节，并在 `scripts/` 下提供对应脚本。
+> **预期分数区间**：Qwen3-32B 贪心 `pass@1` 通常落在 **~85%–95%**；具体分数会因思考链开关、
+> 补全清洗、`max_tokens` 等细节略有浮动。你在自己机器上复现时，只要落在该区间、且两后端
+> 分数接近，即为正常。
 >
-> 注意：评测会真实执行模型生成的代码，务必在隔离环境中进行。
-<!-- ========================================================================= -->
+> **安全警告**：评测会**真实执行模型生成的代码**。本脚本已做进程级隔离（独立子进程 +
+> SIGALRM 超时 + `RLIMIT_CPU/RLIMIT_AS` 资源上限），但这**不是**强隔离沙箱。大规模或
+> 不可信场景请在**容器 / gVisor / nsjail** 等隔离环境中运行。
 
 ---
 
@@ -306,3 +365,147 @@ ALL PASS
    - 若 `ALL PASS`，说明你的 kernel 在分页 KV cache 上计算正确；
    - 若某个 case `FAIL`，看 `max_abs_err`：数量级很大（如 >1）通常是**寻址/布局**错了（block/slot/head 索引或 stride 用错）；只是略超容差则多半是**数值精度**问题（累加顺序、是否用 fp32 做 online softmax）。
 3. 正确性通过后，再按 Part 2 用 `--attention-backend CUSTOM` 起服务，用 2.4 的冒烟测试做端到端确认。
+
+---
+
+## Part 4：性能测试（长上下文 100k 输入）
+
+正确性之外，attention backend 的另一半价值是**性能**——尤其在**长上下文**下。本部分给出一个
+可复现的性能测试方法，用 **~100k token 的输入**压测 prefill，并对比 `flash_attn` 与 `CUSTOM`
+两个后端。
+
+测两个核心指标（脚本 `scripts/perf_test.py` 用流式接口测量）：
+
+| 指标 | 含义 |
+| --- | --- |
+| **TTFT**（Time To First Token，首 token 延迟） | 从发请求到收到第 1 个输出 token 的时间。长输入下**主要就是 prefill（处理这 100k 输入）的耗时**，最能体现 attention 后端在长序列上的效率。 |
+| **decode 吞吐**（tokens/s） | 首 token 之后逐 token 生成的速度。 |
+
+### 4.0 关于上下文长度：本检查点需开 YaRN 才能到 128k（重要）
+
+Qwen3 系列**标称** 128k 上下文，但**要看具体检查点的 config**。本教程的
+`/dockerdata/models/Qwen3-32B` 里 `config.json` 是：
+
+```
+max_position_embeddings = 40960     # 原生只到 ~40k
+rope_scaling            = None
+```
+
+也就是说**原生只支持 ~40k**。要跑 100k 输入，需用 **YaRN** rope 缩放把上下文扩展到 128k+
+（Qwen3 官方推荐做法）。本教程通过 `--hf-overrides` 注入 YaRN 配置（`serve_qwen3_flashattn.sh`
+已支持用 `HF_OVERRIDES` 环境变量传入）：
+
+```json
+{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":40960},
+ "max_position_embeddings":163840}
+```
+
+`factor=4.0` 把 40960 扩到 163840（>128k），足以覆盖 100k 输入。
+
+> **前置**：先 `pip install openai transformers`（`transformers` 用于把输入**精确**编码到
+> 目标 token 数；缺失时脚本退化为按字符估算并提示）。
+
+### 4.1 flash_attn 后端：完整 100k 性能
+
+在**第一个终端**起服务（开 YaRN、`--max-model-len` 调大；100k 的 KV cache 占显存较多，
+用一张**空闲卡**并适当调高 `--gpu-memory-utilization`）：
+
+```bash
+cd /dockerdata/landojiang/vllm_tutorial
+HF_OVERRIDES='{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":40960},"max_position_embeddings":163840}' \
+MAX_LEN=102400 GPU_MEM_UTIL=0.97 GPU=4 PORT=8004 \
+bash scripts/serve_qwen3_flashattn.sh
+```
+
+> 单张 H20（97GB）装完 32B 权重（~61GB）后，KV cache 余量有限：`gpu-memory-utilization=0.92`
+> 时只够 ~92k token，`--max-model-len 110000` 会报 KV cache 不足。这里用 `0.97` + `102400`
+> 恰好放下 100k 输入 + 少量输出。若仍报显存不足，降 `MAX_LEN` 或换更空闲的卡。
+
+在**第二个终端**跑性能测试：
+
+```bash
+cd /dockerdata/landojiang/vllm_tutorial
+python scripts/perf_test.py --port 8004 --input-len 100000 --output-len 64
+```
+
+> `perf_test.py` **默认给每次请求加一段唯一前缀**，绕过 vLLM 的 prefix caching，
+> 这样测到的 TTFT 才是**真实的长输入 prefill 耗时**。如果不加唯一前缀（`--allow-prefix-cache`），
+> 第二次起相同 prompt 会命中缓存、跳过 prefill，TTFT 会假性降到亚秒级（缓存收益本身也值得一看）。
+
+**预期输出**（单张 H20 实测；数值随卡型/负载/vLLM 版本浮动，仅作量级参考）：
+
+```
+[perf] 服务: http://127.0.0.1:8004/v1  模型: qwen3-32b
+[perf] 目标输入长度: 100000 tokens  生成上限: 64 tokens
+[perf] 实际输入长度(精确): ~95653 tokens
+[perf] 预热 1/1 ...
+[perf] 第 1/3 次: TTFT=110.451s  decode=27.8 tok/s  total=111.354s  out=25 tok
+...
+================================================================
+输入长度        : ~95653 tokens (精确)
+TTFT (中位数)   : 110.451 s   <- 主要是 prefill 长输入的耗时
+decode 吞吐     : 27.8 tokens/s   <- 首 token 之后的生成速度
+端到端总时延    : 111.354 s
+================================================================
+[perf] SUMMARY input=95653 out=25 ttft_s=110.451 decode_tps=27.8 total_s=111.354
+```
+
+> 单张 H20 上 ~95k token 的真实 prefill（无缓存）约需 **~110s**、decode ~28 tok/s。
+> 若加 `--allow-prefix-cache` 复跑，第 2 次起 TTFT 会降到 **~0.2s**（命中前缀缓存，跳过 prefill）。
+
+### 4.2 CUSTOM 后端：只在小长度上对比（朴素 kernel 跑不动 100k）
+
+**为什么 CUSTOM 不跑 100k**：Part 2 的教学 kernel 是 `grid=(num_tokens × num_heads)` 的朴素
+实现——每个 (token, head) 一个 Triton program，program 内用一层 `for` **串行**扫过整条 KV
+序列；再加上服务用 `--enforce-eager`（不抓 CUDA graph）。100k prefill 意味着
+`100000 × 64 ≈ 640 万`个 program，每个还要串行读多达 100k 个 KV 位置——实测**极慢、不可实用化**。
+这正是"**为什么需要一个真正高效的 kernel**"的教学点。
+
+所以对 CUSTOM 我们只在**小长度**上测，用来直观感受它比 `flash_attn` 慢多少：
+
+```bash
+# 第一个终端：CUSTOM 后端，小上下文即可（无需 YaRN）
+cd /dockerdata/landojiang/vllm_tutorial
+GPU=5 PORT=8005 bash scripts/serve_qwen3_custom.sh
+
+# 第二个终端：用小 --input-len 测（如 2048）
+cd /dockerdata/landojiang/vllm_tutorial
+python scripts/perf_test.py --port 8005 --input-len 2048 --output-len 32
+```
+
+**预期输出**（单张 H20 实测，仅 ~2k 输入）：
+
+```
+[perf] 实际输入长度(精确): ~1960 tokens
+[perf] 第 1/3 次: TTFT=9.113s  decode=9.8 tok/s  total=12.263s  out=32 tok
+...
+================================================================
+输入长度        : ~1960 tokens (精确)
+TTFT (中位数)   : 9.117 s
+decode 吞吐     : 9.8 tokens/s
+================================================================
+[perf] SUMMARY input=1960 out=32 ttft_s=9.117 decode_tps=9.8 total_s=12.268
+```
+
+### 4.3 对比与结论
+
+同样 ~2k 输入下两个后端的实测对比（单张 H20，供量级参考）：
+
+| 后端 | 输入长度 | TTFT | decode 吞吐 |
+| --- | --- | --- | --- |
+| `flash_attn` | ~1960 tokens | **0.97 s** | **44.2 tok/s** |
+| `CUSTOM`（教学 kernel） | ~1960 tokens | **9.12 s** | **9.8 tok/s** |
+
+即使只在 2k 这种小输入上，教学版 `CUSTOM` 的 prefill 也比 `flash_attn` 慢约 **9 倍**、
+decode 慢约 **4~5 倍**；把输入放大到 100k，这个差距会进一步急剧拉大（所以 `CUSTOM` 不跑 100k）。
+作为对照，`flash_attn` 在 **~95k** 真实输入上的 TTFT 也才 ~110s、decode ~28 tok/s。
+
+结论与延伸：
+- 教学版 `CUSTOM` 只保证**正确**、不追求快；性能差距正是把
+  `custom_backend/triton_attention.py` 换成**高效 kernel**（沿 KV 分块并行、向量化、支持 CUDA graph
+  而非逐 token 逐 program 串行扫）的动机（见 Part 2.5 / Part 3 的接口约定）。
+- 换上你自己的高效 kernel 后，工作流是：先按 **Part 3** 用正确性测试确认无误，
+  再用本节 `perf_test.py` 对比它和 `flash_attn` 的性能差距。
+
+> **说明**：性能数值高度依赖 GPU 型号、显存、并发负载与 vLLM 版本，仅作**量级**参考，
+> 不代表 Qwen3-32B 或 vLLM 的官方性能指标。

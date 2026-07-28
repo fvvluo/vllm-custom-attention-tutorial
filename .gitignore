@@ -10,3 +10,5 @@ logs/
 build/
 dist/
 # vllm 源码是通过 scripts/setup_vllm_source.sh 克隆到仓库外的，不纳入版本管理
+# HumanEval 数据集来自官方 openai/human-eval，首次运行 humaneval_generate.py 会自动下载缓存，不纳入版本管理
+data/

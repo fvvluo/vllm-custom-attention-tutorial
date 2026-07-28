@@ -16,9 +16,19 @@ PORT="${PORT:-8000}"
 GPU="${GPU:-0}"                 # 用哪张卡
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
 MAX_LEN="${MAX_LEN:-8192}"      # 单卡演示用，够跑 human eval / 冒烟测试
+# 可选：HF config 覆盖（JSON）。用于长上下文性能测试时开 YaRN rope 扩展到 128k。
+# 该检查点 config 里 max_position_embeddings=40960（原生 ~40k），要跑 100k 输入需设：
+#   HF_OVERRIDES='{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":40960},"max_position_embeddings":163840}'
+HF_OVERRIDES="${HF_OVERRIDES:-}"
 
 export CUDA_VISIBLE_DEVICES="${GPU}"
 export PYTHONPATH="${VLLM_SRC}:${PYTHONPATH:-}"
+
+EXTRA_ARGS=()
+if [[ -n "${HF_OVERRIDES}" ]]; then
+    EXTRA_ARGS+=(--hf-overrides "${HF_OVERRIDES}")
+fi
+
 # 该 commit 用 --attention-backend 选后端；flash_attn 是默认，这里显式写出以作教学。
 exec python -m vllm.entrypoints.openai.api_server \
     --model "${MODEL}" \
@@ -26,4 +36,5 @@ exec python -m vllm.entrypoints.openai.api_server \
     --port "${PORT}" \
     --gpu-memory-utilization "${GPU_MEM_UTIL}" \
     --max-model-len "${MAX_LEN}" \
-    --attention-backend flash_attn
+    --attention-backend flash_attn \
+    "${EXTRA_ARGS[@]}"
