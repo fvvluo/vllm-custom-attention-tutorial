@@ -290,46 +290,80 @@ E2E = TTFT(76%) + 1000×TPOT(24%)。正确性测试 `ALL PASS` 是所有方案�
 
 ---
 
-## 7. 需要你决策的点（请拍板，我据此进入实现）
+## 7. 决策（D1–D4，已按推荐口径定稿）
 
-**D1 — 先打通哪条闭环？**（决定第一步动手对象）
-- (a) 只做轨-0（修 import + 关 chunked prefill），先让**无损/稀疏 prefill 在 100k 评分路径上真正跑起来**，
-  拿到第一组 TTFT 数字与 `correctness.png`。← 推荐，最快见效、风险最低。**但注意：此时 decode 仍
-  eager，E2E 总分不会好看（TPOT 项爆炸）——这一步只为验证 prefill/稀疏的单点收益。**
-- (b) 直接上轨-A（CUDA graph 改造），先把 TPOT 项拉回正常。← 收益大但工程重；**是拿到有效 E2E 分的前提**。
-- (c) 直接上轨-B.1（稀疏调 tau + 质量自测）。← 依赖轨-0 先打通。
+下面把 §5/§6 的推荐答案定为**已采纳的决策**，作为 §8 路线图的依据。若你要改任一项，
+告诉我编号，我改这里并同步 §8。
 
-**D2 — chunked prefill 怎么处理？**（BUG-2 的解法）
-- (a) 配置法：serve 关 chunked prefill + 调大 `--max-num-batched-tokens`（快，先验证稀疏收益）。
-- (b) kernel 法：扩展 prefill kernel 支持 context 矩形 causal（慢，生产正道）。
-- （可先 a 后 b。）
+| 决策 | 选定 | 一句话理由 |
+|---|---|---|
+| **D1 先打通哪条闭环** | **(a) 先轨-0**，紧接 (b) 轨-A | 轨-0 零风险、先证明 prefill/稀疏能触发并拿 `correctness.png`；但 E2E 有效分要靠轨-A |
+| **D2 chunked prefill 解法** | **先 (a) 配置法，后 (b) kernel 法** | 配置法零 kernel 改动即可让稀疏 kernel 在评分路径跑起来；验证有效后再投 kernel 化做生产正道 |
+| **D3 精度预算** | **(a)→(b) 递进**，(c) fp8 视收益再定 | 先无损把 E2E 追平/微超守正确性；再开 sparse 换 TTFT（tau=1 必过正确性测试）；fp8 收尾可选 |
+| **D4 E2E 主攻项** | **先 TPOT（轨-A 入场券）再 TTFT（轨-0+B 主战场）** | 不做 CUDA graph，TPOT 项直接把总分拖垮；拉正后 TTFT(76%) 才是拉开加速比的地方 |
 
-**D3 — 有损到什么程度？**（精度预算；正确性测试 `ALL PASS` 是所有选项的底线）
-- (a) 先只做**无损**（dense prefill + paged decode + CUDA graph），把 flash 的 E2E 追平/微超，不碰精度。
-- (b) 允许 **sparse**（tau 自适应），tau=1 过正确性测试后降 tau 换 TTFT，HumanEval 自测掉 ≤1~2 题。
-- (c) 进一步允许 **fp8 KV**（压 TPOT/PV），过 `2e-2` 正确性测试 + 端到端 HumanEval 守质量。
-
-**D4 — E2E 里主攻哪一项？**（决定实现顺序）
-- E2E = TTFT(76%) + 1000×TPOT(24%)。**TTFT 是最大预算块**（稀疏/更快 prefill kernel），**TPOT 是
-  入场券**（不做 CUDA graph 直接输）。默认建议：**先轨-A 把 TPOT 拉正常 → 再轨-0+B 猛砍 TTFT**。
-  若你想先看单点效果，也可先轨-0 验证 prefill。告诉我优先级，我把实现顺序对齐。
+> 一句话总纲：**轨-0（解阻塞）→ 轨-A（拉正 TPOT，拿有效 E2E）→ 轨-B（砍 TTFT/压 TPOT，超越 flash）**，
+> 全程正确性测试 `ALL PASS` 是硬底线。
 
 ---
 
-## 8. 建议的实现顺序（若你认可，等 §7 决策后细化为任务）
+## 8. 实现路线图（D1–D4 已落地为四个阶段）
 
-1. **轨-0**：修 BUG-1 → 回归 `test_wzc_sparse.py`/`test_wzc_decode.py` → 改 serve 脚本关 chunked
-   prefill → 确认 `test_paged_attn_correctness.py` `ALL PASS`（`correctness.png`）→ 用
-   `perf_test.py --input-len 100000` 拿到「dense/tau=1 无损」的 TTFT（此时 decode 仍 eager，
-   E2E 仅作 TTFT 单项参考）。
-2. **轨-A（拉正 TPOT，拿有效 E2E）**：CUDA graph 化后端（batched paged decode + 稳定 metadata），
-   去 `--enforce-eager`，`perf_test` 复测完整 E2E，与 flash 147s 对比建立**真实 baseline 差距**。
-3. **轨-B.1 猛砍 TTFT**：完整 HumanEval `pass@1` 在 tau∈{1.0, 0.999, 0.99, 0.95} 上扫，画
-   pass@1 vs E2E 帕累托，定生产 tau；确保 tau=1 仍过正确性测试。
-4. **轨-B.2（可选，压 TPOT/中长 prefill）**：fp8 KV decode（V K-major + descale），过 `2e-2`
-   正确性测试 + 端到端 HumanEval 守质量。
+每个阶段有明确**入口→动作→验收 gate**；未过 gate 不进下一阶段。测速纪律见文末。
 
-> 每步都遵循本项目一贯方法论（记忆库/HANDOFF）：算法先行→torch 参考→kernel→`--check-only`
+### 阶段 0 —— 解阻塞（对应 D1-a / D2-a，零风险，先做）
+- **动作**：
+  1. 修 **BUG-1**：`custom_backend/wzc_sparse_attention.py` 的 `_load_kernel()` 改
+     `from ops import _wzc_attn_sparse as k`，订正 docstring 里 c4/c5 引用。
+  2. 回归 `tests/test_wzc_sparse.py`、`tests/test_wzc_decode.py`（应全绿）。
+  3. 改 `scripts/serve_qwen3_custom.sh`：加 `--no-enable-chunked-prefill --max-num-batched-tokens 102400`
+     （**D2-a**，让 100k prompt 作为一次 pure-prefill 进 `forward`，触发 square 稀疏 kernel）。
+- **验收 gate**：
+  - `tests/test_paged_attn_correctness.py` → **`ALL PASS`**（产出 `correctness.png`）。
+  - `WZC_SPARSE_STATS=1` serve 下发 100k 请求，日志出现 `kernel_reqs` 递增、`max_kernel_seq` 逼近
+    ~95k（**证明稀疏 kernel 真的在评分路径上跑，而非 torch 回退**）。
+  - `perf_test.py --input-len 100000`（tau=1 无损）拿到 TTFT。**注意**：此时 decode 仍 eager，
+    E2E 总分不看，仅记 TTFT 单项。
+
+### 阶段 A —— 拉正 TPOT，拿有效 E2E（对应 D4「入场券」，工程重但必做）
+- **入口**：阶段 0 gate 通过。
+- **动作**：
+  1. 让 `CustomTritonBackend` 可被 CUDA graph 捕获：提升 `_cudagraph_support`，`forward` 去除
+     运行期 `.tolist()`/python per-request 循环（graph 要求 shape/控制流稳定）。
+  2. decode 改 **batched paged decode**（一次 kernel 处理整 batch 单 token）——给现有
+     `PagedKVDecoder` 加 batched wrapper 或多请求分派。
+  3. serve 去掉 `--enforce-eager`（及 `--no-async-scheduling`）。
+- **验收 gate**：
+  - 正确性测试仍 `ALL PASS`（无损，不碰精度）。
+  - `perf_test.py` 完整 **E2E**：TPOT 拉回 baseline 量级（~35ms，≠ eager 的 ~102ms）；
+    与 flash 147s 建立**真实差距基线**。这是第一份可提交的 `performance.png`。
+
+### 阶段 B —— 砍 TTFT，超越 flash（对应 D3-b / D1-c，有损但守闸门）
+- **入口**：阶段 A gate 通过（有了有效 E2E）。
+- **动作**：
+  1. 用阶段 0 已触发的 `_wzc_attn_sparse.py`，在 tau∈{1.0, 0.999, 0.99, 0.95} 扫。
+  2. 完整 HumanEval `pass@1` 自测（vs flash 145/164），画 **pass@1 vs E2E 帕累托**，定生产 tau。
+  3.（可选，D2-b）若确认稀疏有效，投 kernel 化的 context 矩形 causal，去掉 `--no-enable-chunked-prefill`
+     的配置依赖，做生产正道。
+- **验收 gate**：
+  - **tau=1 仍过 `test_paged_attn_correctness.py`（`ALL PASS`）**——有损方案的正确性底线。
+  - 选定 tau 下 HumanEval 掉 ≤1~2 题；`perf_test` E2E **低于 147s**（加速比 > 1）。
+
+### 阶段 C —— fp8 KV（对应 D3-c，可选收尾，压 TPOT/中长 prefill）
+- **入口**：阶段 A（+B）稳定；有余力再做。
+- **动作**：KV cache 存 fp8（e4m3），先 decode（V 需 K-major 物理布局 + per-tensor descale fold 进
+  `softmax_scale_log2`），再考虑 prefill PV。
+- **验收 gate**：过 `test_paged_attn_correctness.py`（bf16 `2e-2`，实测确认 fp8 量化误差在容差内）
+  + 端到端 HumanEval 守质量。**不看** `bench_attention.py` 的 decode `1e-3`（内核 microbench，不进评分）。
+
+### 阶段依赖图
+```
+阶段0(解阻塞) ──► 阶段A(CUDA graph, 拉正 TPOT) ──► 阶段B(稀疏, 砍 TTFT) ──► 阶段C(fp8, 可选)
+   │ gate: correctness ALL PASS        │ gate: 有效 E2E          │ gate: tau=1 无损+E2E<147   │ gate: 2e-2+HumanEval
+   └ 也可单独先跑，只为验证 prefill 单点收益（E2E 总分此时无意义）
+```
+
+> 每阶段都遵循本项目一贯方法论（记忆库/HANDOFF）：算法先行→torch 参考→kernel→`--check-only`
 > 对拍→空闲卡上 `--warmup/--iters` 稳定测速→诚实区分「正确」与「达标」。测速务必
 > `nvidia-smi` 确认目标卡 util=0%（机器多人共用，GPU 0 常被占）。
 > **评分提交口径**：`correctness.png`（`ALL PASS`）+ `performance.png`（含 `E2E 评分` 与末行
