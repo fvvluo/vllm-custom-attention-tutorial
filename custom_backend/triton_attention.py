@@ -141,33 +141,9 @@ def paged_attention_triton(
     - GQA：num_heads 可以是 num_kv_heads 的整数倍，Q 头映射到共享的 KV 头。
     - output 原地写入并返回。
     """
-    num_tokens, num_heads, head_size = query.shape
-    num_kv_heads = key_cache.shape[1]
-    block_size = key_cache.shape[2]
-    max_num_blocks = block_table.shape[1]
+    from .cute_attention_kernel import paged_attention
 
-    grid = (num_tokens, num_heads)
-    _paged_attn_kernel[grid](
-        output,
-        query,
-        key_cache,
-        value_cache,
-        query_start_loc,
-        seq_lens,
-        token_seq_idx,
-        block_table,
-        scale,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        HEAD_SIZE=head_size,
-        BLOCK_SIZE=block_size,
-        max_num_blocks=max_num_blocks,
-        q_stride_t=query.stride(0), q_stride_h=query.stride(1),
-        o_stride_t=output.stride(0), o_stride_h=output.stride(1),
-        kc_stride_b=key_cache.stride(0), kc_stride_h=key_cache.stride(1),
-        kc_stride_s=key_cache.stride(2),
-        vc_stride_b=value_cache.stride(0), vc_stride_h=value_cache.stride(1),
-        vc_stride_s=value_cache.stride(2),
-        block_table_stride=block_table.stride(0),
+    return paged_attention(
+        query, key_cache, value_cache, output, query_start_loc, seq_lens,
+        token_seq_idx, block_table, scale,
     )
-    return output

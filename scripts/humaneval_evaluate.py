@@ -107,12 +107,34 @@ def _run_in_this_process(program: str, timeout_s: int,
 
 
 def _worker(args) -> tuple:
-    """ProcessPoolExecutor 的任务入口（顶层函数，可被 pickle）。"""
+    """Pool worker：为每道题再启动一次性子进程，避免 rlimit 跨题累计。"""
+    import multiprocessing as mp
+
     task_id, program, timeout_s, cpu_limit, mem_bytes = args
+    ctx = mp.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+
+    def _child():
+        try:
+            ok = _run_in_this_process(program, timeout_s, cpu_limit, mem_bytes)
+            child_conn.send(ok)
+        except BaseException:
+            pass
+        finally:
+            child_conn.close()
+
+    proc = ctx.Process(target=_child)
+    proc.start()
+    child_conn.close()
+    proc.join(timeout_s + cpu_limit + 5)
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
     try:
-        ok = _run_in_this_process(program, timeout_s, cpu_limit, mem_bytes)
-    except BaseException:
+        ok = bool(parent_conn.recv()) if parent_conn.poll() else False
+    except (EOFError, OSError):
         ok = False
+    parent_conn.close()
     return task_id, ok
 
 
