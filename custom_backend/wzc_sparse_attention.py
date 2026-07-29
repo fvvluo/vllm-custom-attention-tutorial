@@ -269,11 +269,18 @@ def paged_attention_wzc(
         block_size = key_cache.shape[2]
 
         # DECODE (q_len==1, has context) -> wzc paged decode kernel. Needs GQA
-        # group == 8 and head_size 128. If the vLLM block_size already equals the
-        # kernel page_size (128), take the ZERO-COPY fast path (no gather/repack).
+        # group == 8 and head_size 128. The ZERO-COPY fast path requires the vLLM
+        # paged cache to ALREADY be the kernel's pool layout: block_size==128 AND
+        # the per-page K tile physically contiguous with head_dim leading. vLLM's
+        # CUSTOM cache packs K|V in the last dim (…, block_size, 2*hs), so the
+        # `key_cache` half-slice has a STRIDED slot dim (stride 2*hs, not hs) ->
+        # the kernel's `_kv_to_cute` (mark_compact_shape_dynamic) rejects it
+        # ("stride_order not consistent"). So only take zero-copy when key_cache is
+        # actually contiguous in the kernel's layout; otherwise fall through to
+        # _decode_one (gather+repack into a proper contiguous 128-page pool).
         decode_ok = (use_sparse and q_len == 1 and seq_len > 1
                      and num_heads == key_cache.shape[1] * _DECODE_GROUP)
-        if decode_ok and block_size == _PAGE:
+        if decode_ok and block_size == _PAGE and key_cache.is_contiguous():
             output[q0:q1] = _decode_one_zerocopy(
                 q[0], key_cache, value_cache, block_table, req, seq_len, scale
             ).unsqueeze(0).to(output.dtype)
