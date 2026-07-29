@@ -116,3 +116,89 @@ both released after use. No processes killed except my own serve (SIGINT).
 
 - GPU discipline: intended to use an idle GPU; runtime device index was not
   captured in the logs (see item B).
+
+## Phase V3.1 — measurement-integrity audit + independent-process retest (Liu Xiaochen)
+
+Executed on the shared host (NOT a dedicated container); every step re-checked the
+GPU live and bound the physical device via `CUDA_VISIBLE_DEVICES` (recorded below).
+No V3/V2 kernel math / MMA / cp.async / combine changed; no PDL; no extra stage; not
+wired to CUSTOM backend. New file only: `verify_paged_decode_v3_integrity.py`.
+
+### A. Integrity audit — PASS (physical GPU 5, UUID 6afcc978-…-a586e)
+`logs/v3_1_integrity.log`, `INTEGRITY_AUDIT=PASS`, `EXIT_CODE=0`, 26/26 checks PASS
+(seq_len=8192, num_seqs=1, split=256, shuffle):
+- A→B→A: A1==A2 bit-identical, A≠B (max_abs 9.84e-2) — PASS
+- pointer rebinding: same compiled kernel reused for B and A2 (cache size 1), no
+  first-call tensor capture — PASS
+- V3 vs V2: torch.equal, max_abs 0.000e+00 (both A and B) — PASS
+- V3 vs PyTorch ref: A 2.32e-4, B 2.12e-4 (≤5e-3) — PASS
+- K/V data replacement (same object, in-place swap): output changes then restores
+  to A1; data_ptr stable — PASS
+- partial_o NaN poisoning: output == A1, no NaN/Inf — PASS (**the real
+  stale-workspace evidence**)
+- output pointer: outA/outB data_ptr unchanged across calls — PASS
+- empty-split neutrality (max_seq_len 10240 > 8192): empty partial_o==0,
+  empty lse==-inf, valid splits NaN-free, output==A1 — PASS
+- **Accurate limitation (NOT a failure):** the runner unconditionally runs
+  `lse.fill_(-inf)` each call (runner_v3.py:136), so lse-poisoning is wiped before
+  the kernel and is NOT independent stale-workspace evidence; partial_o poisoning is
+  the load-bearing probe. The integrity case (seq 8192, split 256) has full/empty
+  splits only and does NOT cover partial tiles — partial tiles are covered by the V3
+  irregular correctness suite (verify_paged_decode_v3.py).
+
+### B. Independent-process retest — cross-physical-GPU PASS
+Two fresh Python processes, sequential, 128K/split=256/warmup10/iters100/rounds5,
+`--gpu 0` inside each (physical GPU chosen via `CUDA_VISIBLE_DEVICES`):
+- **Process A — physical GPU 5** (UUID 6afcc978-…-a586e), `logs/v3_1_retest_process_a_gpu5.log`, EXIT_CODE=0:
+  V2 S1 3.2006ms; V2 e2e 3.2261 (min3.2258/max3.2264/p90 3.2263); V3 S1 0.2197ms;
+  V3 e2e 0.2445 (min0.2445/max0.2446/p90 0.2446); combine 0.0105ms; V3/V2 13.193x;
+  V3/Triton 320.11x; 2195 GB/s (K+V); workspace 16908288 B; bit_identical=True; no OOM/CUDA-error/fallback.
+- **Process B — physical GPU 3** (UUID 703ca4fb-…-b401d6), `logs/v3_1_retest_process_b_gpu3.log`, EXIT_CODE=0:
+  V2 S1 3.1883ms; V2 e2e 3.2145 (min3.2142/max3.2155/p90 3.2145); V3 S1 0.2202ms;
+  V3 e2e 0.2457 (min0.2456/max0.2459/p90 0.2458); combine 0.0107ms; V3/V2 13.081x;
+  V3/Triton 318.91x; 2185 GB/s (K+V); bit_identical=True; no OOM/CUDA-error/fallback.
+- **A vs B**: V3 e2e diff 0.49%, V2 e2e diff 0.36%, bandwidth diff 0.46%, speedup
+  13.19x vs 13.08x — all ≤10% (excellent). Both cards keep V3 ≫ V2.
+- **Reproduces original V3 0.245ms and 13.15x** (A 0.2445/13.19x, B 0.2457/13.08x).
+
+### C. Length scaling — PASS (physical GPU 3), `logs/v3_1_length_scaling_gpu3.log`, all EXIT_CODE=0
+num_seqs=1, split=256, warmup10/iters100/rounds5.
+| seq_len | num_splits | V2 S1 ms | V2 e2e ms | V3 S1 ms | V3 e2e ms | combine ms | V3/V2 | GB/s(K+V) | V3 e2e min/med/max/p90 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 16384  | 64  | 0.7062 | 0.7136 | 0.0392 | 0.0991 | 0.0061 | 7.20x  | 677  | 0.0971/0.0991/0.1083/0.0992 |
+| 32768  | 128 | 1.0633 | 1.0735 | 0.0646 | 0.1005 | 0.0062 | 10.68x | 1335 | 0.1002/0.1005/0.1021/0.1006 |
+| 65536  | 256 | 1.7649 | 1.7809 | 0.1146 | 0.1312 | 0.0065 | 13.58x | 2047 | 0.1310/0.1312/0.1312/0.1312 |
+| 131072 | 512 | 7.0407 | 7.0886 | 0.4656 | 0.5382 | 0.0107 | 13.17x | 997  | 0.5380/0.5382/0.5384/0.5384 |
+- Trend: V3 Stage-1 rises monotonically 0.039→0.065→0.115→0.466ms (not flat — no
+  missing kernel); 64K→128K Stage-1 ~4.06x (work ~2x per doubling; extra factor is
+  the 128K contention below). combine stays ~0.006–0.011ms (never the bottleneck).
+- **128K length-scaling point is CONTENDED/anomalous:** midway through the sweep a
+  foreign task (PID 1804858, 92GB, 100% util) co-landed on GPU 3. All three kernels
+  slowed ~2.2x uniformly at 128K (triton 78→168ms, V2 3.23→7.09ms, V3 0.245→0.538ms)
+  while V3/V2 held at 13.17x — a bandwidth-contention signature, NOT a kernel change.
+  The clean 128K numbers are Process A/B (0.245/0.246ms, ~2190 GB/s). 16K/32K/64K ran
+  clean; GB/s climbs 677→1335→2047 into the memory-bound regime as expected.
+
+### D. CUDA Event timing audit (read-only source review) — sound
+`bench_paged_decode_v3.py time_fn` (L73–82): warmup loop L74–75 → `synchronize` L76 →
+`s.record()` L78 (before the iters loop) → iters×`fn()` L79–80 → `e.record()`+`synchronize`
+L81 → `elapsed_time` L82. For end-to-end V3, `fn=run_v3` (L121–125) → `paged_decode_v3`
+launches Stage-1 (runner_v3.py:182) AND combine (runner_v3.py:183) on the SAME stream
+(runner_v3.py:155–156) — both inside the event window. Stage-1-only (`s1v3`=run_stage1,
+runner_v3.py:246–248) is a separate series from e2e (not conflated). JIT+alloc excluded
+(compiled/warmed at L140 before timing; workspace cached). `random.shuffle` (L151) only
+permutes which self-contained `time_fn` runs — cannot misalign events. **No CUDA Graph**
+(grep: zero graph/capture references). No missing-kernel risk for e2e.
+
+### E. Still pending
+- **Nsight Systems timeline audit** — not run this round (kept pending).
+- No cross-GPU item is pending: A (GPU5) + B (GPU3) both completed.
+
+### V3.1 environment notes / GPU interference this round
+Shared host, not exclusive. GPU 5 clean at Process-A start (47MiB, 0%, 38°C); a
+foreign 88GB task landed on GPU 5 right after A finished. GPU 3 clean for Process B
+and for 16K/32K/64K, then contended at the 128K length-scaling point (see C). No
+process was killed; no card was auto-switched to stitch a single result set.
+- Logs: v3_1_integrity.log, v3_1_retest_process_a_gpu5.log,
+  v3_1_retest_process_b_gpu3.log, v3_1_length_scaling_gpu3.log.
+- Historical stub (NOT this round's evidence): v3_1_integrity_import_failure_20260729_1912.log.

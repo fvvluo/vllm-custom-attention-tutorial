@@ -147,3 +147,27 @@ does not overclaim:
 > performed in the dedicated per-user container or another clean GPU
 > environment. This does not invalidate the existing V3 correctness,
 > benchmark, or Nsight evidence.
+
+## D9. V3.1 measurement-integrity audit — executed (shared host, physical GPUs recorded)
+Update to D8 item C: the audit was subsequently run on the shared host with live
+per-step GPU rechecks and explicit `CUDA_VISIBLE_DEVICES` binding. Only a test harness
+(`verify_paged_decode_v3_integrity.py`) was added; no V3/V2 kernel/MMA/cp.async/combine
+change, no PDL, no extra stage, no CUSTOM-backend wiring. Full tables in WORKLOG "Phase V3.1".
+- **Integrity audit PASS** (physical GPU 5, UUID 6afcc978): `INTEGRITY_AUDIT=PASS`,
+  `EXIT_CODE=0`, 26/26 — A→B→A, pointer rebinding, V3==V2 bit-identical, V3 vs ref
+  ≤5e-3, K/V replacement, partial_o NaN poisoning, output pointer, empty-split 0/-inf.
+- **Decision — lse-poisoning is deliberately NOT claimed as stale-workspace evidence:**
+  the runner runs `lse.fill_(-inf)` every call (runner_v3.py:136), so a poisoned lse is
+  overwritten before the kernel. We treat **partial_o** poisoning as the load-bearing
+  stale-workspace probe (partial is never reset by the runner; the kernel must fully
+  overwrite it). This is recorded as a limitation, not a failure. Partial-tile coverage
+  is delegated to the V3 irregular correctness suite (integrity case has full/empty
+  splits only).
+- **Cross-physical-GPU independent-process retest PASS:** GPU 5 (0.2445ms/13.19x) and
+  GPU 3 (0.2457ms/13.08x), A/B diff ≤0.5%; reproduces original 0.245ms/13.15x.
+- **Length scaling PASS** (GPU 3): 16K/32K/64K clean; **128K contended** (foreign task
+  co-landed → uniform ~2.2x slowdown, V3/V2 ratio unchanged) — clean 128K is the retest.
+- **Decision — do NOT auto-switch cards or cherry-pick under contention:** contended
+  points are labeled anomalous and kept; no re-run to fish for a better number.
+- **Still pending:** Nsight Systems timeline audit (not run this round). V3 remains NOT
+  committed for V3.1 (this round is audit-only; no commit/push).

@@ -265,13 +265,50 @@ deeper cp.async pipeline (3-4 stage), PDL, or wiring into the CUSTOM backend.
 Decode-only; fixed 64/8/128/16 shape; 2-stage depth; no PDL; not wired to CUSTOM
 backend; requires 16-byte-aligned contiguous-D paged cache (raises otherwise).
 
-## V3.1 pending (NOT executed this round — no artifacts on disk)
-The following are planned but have **no logs, no result files, no commits** yet;
-they must be run in a dedicated per-user container or another clean GPU environment
-(the current shared machine has no clean GPU):
-- two-GPU **independent-process retest** of correctness + benchmark;
-- **Part VI length scaling**;
-- **pointer rebinding / stale workspace** dedicated audit;
-- **Nsight Systems timeline** audit.
+## V3.1 measurement-integrity audit — RESULTS (executed on shared host)
+Run with live per-step GPU rechecks and explicit `CUDA_VISIBLE_DEVICES` binding; the
+physical GPU + UUID are recorded for every run. Only a test harness
+(`verify_paged_decode_v3_integrity.py`) was added — no kernel/MMA/cp.async/combine
+change, no PDL, no extra stage, not wired to CUSTOM backend. Full tables in
+`docs/WORKLOG.md` ("Phase V3.1").
 
-None of these are PASS. See "Evidence boundary" above.
+### Integrity audit — PASS (physical GPU 5, UUID 6afcc978-…-a586e)
+`logs/v3_1_integrity.log` → `INTEGRITY_AUDIT=PASS`, `EXIT_CODE=0`, 26/26 checks
+(seq_len=8192, split=256, shuffle): A→B→A, pointer rebinding (same compiled kernel
+reused, no first-call capture), V3==V2 bit-identical (max_abs 0), V3 vs ref ≤5e-3
+(2.3e-4 / 2.1e-4), K/V in-place data replacement, **partial_o NaN poisoning**,
+output-pointer identity, empty-split partial_o==0 / lse==-inf.
+- **Accurate limitation (not a failure):** the runner does `lse.fill_(-inf)` each call
+  (runner_v3.py:136), so lse-poisoning is masked → **partial_o poisoning is the real
+  stale-workspace evidence**. The integrity case has full/empty splits only; **partial
+  tiles are covered by the V3 irregular correctness suite**, not here.
+
+### Independent-process retest — cross-physical-GPU PASS
+Two fresh processes, 128K/split=256, `--gpu 0` under `CUDA_VISIBLE_DEVICES`:
+| process | phys GPU | UUID | V3 e2e ms | V3/V2 | GB/s(K+V) | exit |
+|---|---|---|---:|---:|---:|---:|
+| A | 5 | 6afcc978-…-a586e | 0.2445 | 13.193x | 2195 | 0 |
+| B | 3 | 703ca4fb-…-b401d6 | 0.2457 | 13.081x | 2185 | 0 |
+A/B diff ≤0.5% on e2e/bandwidth/speedup; both bit_identical, no OOM/CUDA-error/fallback.
+**Reproduces the original 0.245 ms and 13.15x** on two distinct physical GPUs.
+
+### Length scaling — PASS (physical GPU 3), all EXIT_CODE=0
+| seq_len | num_splits | V3 S1 ms | V3 e2e ms | V3/V2 | GB/s(K+V) |
+|---:|---:|---:|---:|---:|---:|
+| 16384 | 64 | 0.0392 | 0.0991 | 7.20x | 677 |
+| 32768 | 128 | 0.0646 | 0.1005 | 10.68x | 1335 |
+| 65536 | 256 | 0.1146 | 0.1312 | 13.58x | 2047 |
+| 131072 | 512 | 0.4656 | 0.5382 | 13.17x | 997 |
+V3 Stage-1 rises monotonically (no missing kernel); combine stays ~0.006–0.011 ms.
+**128K point is CONTENDED** (a foreign task co-landed on GPU 3 mid-sweep → all three
+kernels ~2.2x slower, V3/V2 ratio unchanged at 13.17x). The clean 128K numbers are the
+independent-process retest above (0.245/0.246 ms, ~2190 GB/s).
+
+### CUDA Event timing audit — sound (read-only)
+Same CUDA stream; Stage-1 + combine both inside the `start.record()…end.record()`
+window (runner_v3.py:182–183); JIT/allocation excluded; **no CUDA Graph**; randomized
+order cannot misalign events; Stage-1-only vs end-to-end are separate series.
+
+### Still pending
+- **Nsight Systems timeline audit** — not run this round.
+This round is audit-only: V3 is NOT committed/pushed for V3.1.

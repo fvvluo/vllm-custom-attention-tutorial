@@ -102,4 +102,28 @@ SM90), directly reading the paged KV-cache via `block_table` (no gather/copy/fal
 > environment. This does not invalidate the existing V3 correctness,
 > benchmark, or Nsight evidence.
 
+### V3.1 UPDATE (executed on shared host; physical GPUs recorded)
+Items C above are now mostly DONE (see docs/WORKLOG.md "Phase V3.1" for full tables).
+New file: `verify_paged_decode_v3_integrity.py` (only addition; no kernel change).
+- **Integrity audit — PASS** on physical GPU 5 (UUID 6afcc978-…-a586e):
+  `logs/v3_1_integrity.log`, `INTEGRITY_AUDIT=PASS`, `EXIT_CODE=0`, 26/26. Covers
+  A→B→A, pointer rebinding, V3==V2 bit-identical, V3 vs ref ≤5e-3, K/V replacement,
+  partial_o NaN poisoning, output pointer, empty-split 0/-inf. Limitation (not a
+  failure): lse-poisoning is masked by the runner's `lse.fill_(-inf)` — partial_o
+  poisoning is the real stale-workspace probe; integrity case has no partial tiles
+  (covered by the V3 irregular correctness suite).
+- **Independent-process retest — cross-physical-GPU PASS:** Process A physical GPU 5
+  (`v3_1_retest_process_a_gpu5.log`, EXIT_CODE=0, V3 e2e 0.2445ms, 13.193x, 2195 GB/s);
+  Process B physical GPU 3 (UUID 703ca4fb-…, `v3_1_retest_process_b_gpu3.log`,
+  EXIT_CODE=0, V3 e2e 0.2457ms, 13.081x, 2185 GB/s). A/B diff ≤0.5%. Original
+  0.245ms / 13.15x reproduced on both.
+- **Length scaling — PASS** on physical GPU 3 (`v3_1_length_scaling_gpu3.log`, all
+  EXIT_CODE=0): 16K 0.099ms/7.20x/677GB/s, 32K 0.101ms/10.68x/1335, 64K 0.131ms/13.58x/2047,
+  128K 0.538ms/13.17x/997. V3 Stage-1 rises monotonically. **128K point CONTENDED**
+  (foreign PID co-landed → all kernels ~2.2x slower, ratio held) — clean 128K is
+  Process A/B.
+- **CUDA Event audit — sound** (read-only): same stream, Stage-1+combine inside the
+  event window, JIT/alloc excluded, no CUDA Graph, random order safe.
+- **Still pending:** Nsight Systems timeline audit (not run this round).
+
 - Next (out of scope this round): deeper cp.async pipeline / PDL / wire into CUSTOM backend.
