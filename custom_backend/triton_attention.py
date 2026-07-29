@@ -1,28 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-简易 Triton attention kernel（教学示例）
-============================================
+自定义分页注意力（paged attention）实现 —— 高性能版
+====================================================
 
-这个文件是【学生需要替换的部分】。它实现了一个最小可用的、支持
-**分页 KV cache（paged KV cache）** 的 attention，覆盖 prefill 与 decode。
+接口约定（保持不变，见 README Part 3.1）：
+  - query:  [num_tokens, num_heads, head_size]
+  - key_cache / value_cache: [num_blocks, num_kv_heads, block_size, head_size]
+    （按 stride 寻址，不假设物理布局；调用方传入的可能是非连续视图）
+  - output: [num_tokens, num_heads, head_size]（原地写入并返回）
+  - query_start_loc: [num_seqs + 1] 每条请求 query 的起始偏移
+  - seq_lens: [num_seqs] 每条请求总长度（context + query）
+  - token_seq_idx: [num_tokens] 每个 token 属于哪条请求（本实现未用到）
+  - block_table: [num_seqs, max_num_blocks] 逻辑块 -> 物理块
 
-设计目标：
-  - 接口清晰：只要你的 kernel 满足 `paged_attention_triton(...)` 的输入/输出约定，
-    就能直接替换本实现并接入 vLLM。
-  - 正确性优先，不追求极致性能：每个 query token 一个 Triton program，
-    在 kernel 内沿 KV 序列做在线 softmax（flash-attention 风格的数值稳定累加）。
+实现：把 ~/attention-test/ops/chh_flash_attention.py 的两个 flash-attention
+内核移植到**分页 KV cache** 寻址上：
 
-KV cache 布局（与 vLLM TRITON_ATTN 后端一致）：
-  kv_cache 逻辑形状 = (num_blocks, num_kv_heads, block_size, 2 * head_size)
-  最后一维前 head_size 是 K，后 head_size 是 V。
-  本模块在调用前已把它拆成 key_cache / value_cache 两个
-  (num_blocks, num_kv_heads, block_size, head_size) 视图传入。
+  1. `_paged_prefill_kernel` —— prefill 内核（任意 n_q）。
+     q/o 用 TMA descriptor（每条请求内部的 q 行是连续的）；K/V 按
+     block_table gather 出物理块号后按 stride 计算行地址做向量 load。
+     两段式 KV 循环：完全可见段无掩码，对角线/尾部段加 causal + 边界掩码；
+     fp32 online softmax（exp2 域）。
+  2. `_paged_decode_fused_kernel` —— decode 内核（n_q == 1 且长 context）。
+     FlashDecoding split-K：grid = (splits, num_kv_heads)，每个 program 负责
+     一个 kv head 的一段 KV，同组全部 g 个 q head 共享同一份 K/V（GQA 流量
+     只读一次）；partial (o, m, l) 写全局暂存，组内最后一个 program 用
+     log-sum-exp 合并并复位信号量（单次 kernel 启动完成 partial + merge）。
 
-如何映射一个 token 到 cache 中的物理位置：
-  对第 req 条请求的第 j 个（全局）位置：
-    block_table[req, j // block_size] -> 物理 block 号 pb
-    槽位 = j % block_size
-  即该 (K,V) 存在 key_cache[pb, kv_head, 槽位, :]。
+与 chh 原版的差异（除分页寻址外）：
+  - autotune 不再以 n_q/n_kv/chunk 为 key：服务时 n_kv 每步递增，会导致
+    每个 decode step 重新调参。改为按 ('D') / ('D','M_PAD') 调一次。
+  - decode 的 splits 用确定性启发式（目标 program 数 ≈ 2x SM 数），
+    不做逐形状的 graph 计时调参。
 """
 
 import torch
@@ -30,96 +39,351 @@ import triton
 import triton.language as tl
 
 
+# ============================================================================
+# device-side TMA descriptor 需要的全局显存暂存区分配器（与 chh 相同）
+# ============================================================================
+_TMA_SCRATCH = [None]
+
+
+def _triton_alloc(size: int, alignment: int, stream):
+    buf = _TMA_SCRATCH[0]
+    if buf is None or buf.numel() < size:
+        buf = torch.empty(size, dtype=torch.uint8, device='cuda')
+        _TMA_SCRATCH[0] = buf
+    return buf
+
+
+triton.set_allocator(_triton_alloc)
+
+
+def _prefill_configs():
+    """prefill kernel 的 autotune 候选。
+
+    只保留 H20 上实测最优的几个配置（micro-benchmark：n_q=8192、
+    n_kv 8k~95k 全范围 (128,32,8,2) 稳定最优 ~138 TFLOPS，几个候选
+    彼此差距 <4%），避免 autotune 在小形状首次调用上误选差配置
+    （如 (128,128,4,2) 仅 ~96 TFLOPS）。
+    """
+    return [
+        triton.Config({'BR': 128, 'BC': 32}, num_warps=8, num_stages=2),
+        triton.Config({'BR': 128, 'BC': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BR': 128, 'BC': 32}, num_warps=8, num_stages=3),
+    ]
+
+
+def _decode_configs():
+    """decode fused kernel 的 autotune 候选。
+
+    只保留 H20 上实测最优的几个（n_kv~95k、sp=38 扫参：
+    (64,4,3)=2.51 TB/s、(128,8,2)=2.44、(64,4,2)=2.43，彼此 <3%）。
+    """
+    return [
+        triton.Config({'BC': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BC': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BC': 128}, num_warps=8, num_stages=2),
+    ]
+
+
+# ============================================================================
+# 1. prefill 内核（分页 KV 版）
+# ============================================================================
 @triton.jit
-def _paged_attn_kernel(
-    # 输出： [num_tokens, num_heads, head_size]
-    out_ptr,
-    # query： [num_tokens, num_heads, head_size]
-    q_ptr,
-    # 分页 KV cache： [num_blocks, num_kv_heads, block_size, head_size]
-    k_cache_ptr,
-    v_cache_ptr,
-    # 元数据
-    query_start_loc_ptr,  # [num_seqs + 1] 每条请求 query 在 flatten 后的起始位置
-    seq_lens_ptr,         # [num_seqs]     每条请求的总长度（context + 本次 query）
-    token_seq_idx_ptr,    # [num_tokens]   每个 token 属于哪条请求（预计算好）
-    block_table_ptr,      # [num_seqs, max_num_blocks] 逻辑块 -> 物理块
-    # 形状 / 步长（标量）
-    scale,
-    num_heads: tl.constexpr,
-    num_kv_heads: tl.constexpr,
-    HEAD_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    max_num_blocks: tl.constexpr,
-    # query 张量步长
-    q_stride_t, q_stride_h,
-    # out 张量步长
-    o_stride_t, o_stride_h,
-    # kv cache 步长
-    kc_stride_b, kc_stride_h, kc_stride_s,
-    vc_stride_b, vc_stride_h, vc_stride_s,
-    block_table_stride,
-):
-    # grid = (num_tokens, num_heads)
-    token_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
+def _paged_fa_inner(o, l, m, q, k_base, v_base, bt_ptr,
+                    n_kv, rows, offset, qk_scale, j_lo, j_hi,
+                    kc_stride_b, kc_stride_s, vc_stride_b, vc_stride_s,
+                    D: tl.constexpr, BC: tl.constexpr, BS: tl.constexpr,
+                    MASKED: tl.constexpr, CAUSAL: tl.constexpr):
+    """遍历 kv block [j_lo, j_hi)，online-softmax 累积（分页寻址）。
 
-    # ---- 1. 定位该 token 属于哪条请求、以及它在该请求内的绝对位置 ----
-    # token->请求 的映射已在 host 端预计算好，直接读即可（避免 kernel 内查找）。
-    seq_idx = tl.load(token_seq_idx_ptr + token_idx)
+    MASKED=False 的段对所有 query 行完全可见且完全在界内，不加任何掩码；
+    块表 gather 出来的物理块号 pb 一定有效（cols < n_kv 保证）。
+    """
+    d_offs = tl.arange(0, D)
+    for j in range(j_lo, j_hi):
+        cols = j * BC + tl.arange(0, BC)
+        lb = cols // BS
+        slot = cols % BS
+        if MASKED:
+            cvalid = cols < n_kv
+            pb = tl.load(bt_ptr + lb, mask=cvalid, other=0).to(tl.int64)
+            k = tl.load(k_base + pb[:, None] * kc_stride_b
+                        + slot[:, None] * kc_stride_s + d_offs[None, :],
+                        mask=cvalid[:, None], other=0.0)
+        else:
+            pb = tl.load(bt_ptr + lb).to(tl.int64)
+            k = tl.load(k_base + pb[:, None] * kc_stride_b
+                        + slot[:, None] * kc_stride_s + d_offs[None, :])
+        s = tl.dot(q, tl.trans(k)) * qk_scale  # fp32
+        if MASKED:
+            mask = (cols < n_kv)[None, :]
+            if CAUSAL:
+                mask = mask & (cols[None, :] <= (rows + offset)[:, None])
+            s = tl.where(mask, s, float("-inf"))
+        m_new = tl.maximum(m, tl.max(s, axis=1))
+        alpha = tl.math.exp2(m - m_new)
+        p = tl.math.exp2(s - m_new[:, None])
+        l = l * alpha + tl.sum(p, axis=1)
+        if MASKED:
+            v = tl.load(v_base + pb[:, None] * vc_stride_b
+                        + slot[:, None] * vc_stride_s + d_offs[None, :],
+                        mask=(cols < n_kv)[:, None], other=0.0)
+        else:
+            v = tl.load(v_base + pb[:, None] * vc_stride_b
+                        + slot[:, None] * vc_stride_s + d_offs[None, :])
+        o = o * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m = m_new
+    return o, l, m
 
-    q_start = tl.load(query_start_loc_ptr + seq_idx)
-    seq_len = tl.load(seq_lens_ptr + seq_idx)         # 该请求总长度
-    query_len = tl.load(query_start_loc_ptr + seq_idx + 1) - q_start
-    # 该 token 在本请求内是第几个 query（0-based）
-    idx_in_query = token_idx - q_start
-    # 该 token 对应的绝对位置（causal 上界）：context 部分 + 该 query 偏移
-    context_len = seq_len - query_len
-    abs_pos = context_len + idx_in_query
 
-    # ---- 2. 载入 query 向量 ----
-    d_offs = tl.arange(0, HEAD_SIZE)
-    q = tl.load(q_ptr + token_idx * q_stride_t + head_idx * q_stride_h + d_offs)
-    q = q.to(tl.float32) * scale
+@triton.autotune(configs=_prefill_configs(), key=['D'])
+@triton.jit
+def _paged_prefill_kernel(q_ptr, k_ptr, v_ptr, o_ptr, bt_ptr,
+                          sqh, sqm, soh, som,
+                          kc_stride_b, kc_stride_h, kc_stride_s,
+                          vc_stride_b, vc_stride_h, vc_stride_s,
+                          n_q, n_kv, h_q, g, qk_scale,
+                          D: tl.constexpr, BS: tl.constexpr,
+                          BR: tl.constexpr, BC: tl.constexpr,
+                          CAUSAL: tl.constexpr):
+    # grid = (cdiv(n_q, BR), q_heads)；batch=1（每次调用处理一条请求）
+    i = tl.program_id(0)
+    h = tl.program_id(1)
+    hk = h // g
 
-    # GQA：多个 Q 头共享一个 KV 头
-    kv_head_idx = head_idx // (num_heads // num_kv_heads)
+    q_desc = tl.make_tensor_descriptor(q_ptr + h * sqh, shape=[n_q, D],
+                                       strides=[sqm, 1], block_shape=[BR, D])
+    o_desc = tl.make_tensor_descriptor(o_ptr + h * soh, shape=[n_q, D],
+                                       strides=[som, 1], block_shape=[BR, D])
+    k_base = k_ptr + hk * kc_stride_h
+    v_base = v_ptr + hk * vc_stride_h
 
-    # ---- 3. 沿 KV 序列做在线 softmax（flash 风格）----
-    m_i = -float("inf")     # running max
-    l_i = 0.0               # running sum of exp
-    acc = tl.zeros([HEAD_SIZE], dtype=tl.float32)
+    q = q_desc.load([i * BR, 0])
 
-    # 只需注意到 abs_pos（含）为止（causal）
-    kv_upper = abs_pos + 1
-    for kv_pos in range(0, seq_len):
-        active = kv_pos < kv_upper
-        # 该 kv 位置的物理地址
-        logical_block = kv_pos // BLOCK_SIZE
-        slot = kv_pos % BLOCK_SIZE
-        pb = tl.load(
-            block_table_ptr + seq_idx * block_table_stride + logical_block,
-            mask=logical_block < max_num_blocks,
-            other=0,
-        )
-        k_off = pb * kc_stride_b + kv_head_idx * kc_stride_h + slot * kc_stride_s + d_offs
-        v_off = pb * vc_stride_b + kv_head_idx * vc_stride_h + slot * vc_stride_s + d_offs
-        k = tl.load(k_cache_ptr + k_off).to(tl.float32)
-        v = tl.load(v_cache_ptr + v_off).to(tl.float32)
+    o = tl.zeros([BR, D], dtype=tl.float32)
+    l = tl.zeros([BR], dtype=tl.float32)
+    m = tl.full([BR], float("-inf"), dtype=tl.float32)
 
-        qk = tl.sum(q * k, axis=0)
-        qk = tl.where(active, qk, -float("inf"))
+    # query 位置 i 的绝对位置为 i + offset（query 对齐到 kv 末尾）
+    offset = n_kv - n_q
+    rows = i * BR + tl.arange(0, BR)
 
-        m_new = tl.maximum(m_i, qk)
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(qk - m_new)
-        l_i = l_i * alpha + p
-        acc = acc * alpha + p * v
-        m_i = m_new
+    if CAUSAL:
+        full = tl.minimum(n_kv, i * BR + offset + 1) // BC
+        limit = tl.minimum(n_kv, i * BR + BR + offset)
+    else:
+        full = n_kv // BC
+        limit = n_kv
+    hi = tl.cdiv(limit, BC)
 
-    out = acc / l_i
-    tl.store(out_ptr + token_idx * o_stride_t + head_idx * o_stride_h + d_offs,
-             out.to(out_ptr.dtype.element_ty))
+    o, l, m = _paged_fa_inner(o, l, m, q, k_base, v_base, bt_ptr,
+                              n_kv, rows, offset, qk_scale, 0, full,
+                              kc_stride_b, kc_stride_s, vc_stride_b, vc_stride_s,
+                              D, BC, BS, False, CAUSAL)
+    o, l, m = _paged_fa_inner(o, l, m, q, k_base, v_base, bt_ptr,
+                              n_kv, rows, offset, qk_scale, full, hi,
+                              kc_stride_b, kc_stride_s, vc_stride_b, vc_stride_s,
+                              D, BC, BS, True, CAUSAL)
+
+    o = o / l[:, None]
+    o_desc.store([i * BR, 0], o.to(o_ptr.dtype.element_ty))
+
+
+# ============================================================================
+# 2. decode 内核（分页 KV 版 FlashDecoding split-K + 融合 merge）
+# ============================================================================
+@triton.autotune(configs=_decode_configs(), key=['D', 'M_PAD'])
+@triton.jit
+def _paged_decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
+                               op_ptr, mp_ptr, lp_ptr, cnt_ptr, bt_ptr,
+                               bhn, n_q, n_kv, h_kv, g, qk_scale, chunk, splits,
+                               kc_stride_b, kc_stride_h, kc_stride_s,
+                               vc_stride_b, vc_stride_h, vc_stride_s,
+                               D: tl.constexpr, BS: tl.constexpr,
+                               M_PAD: tl.constexpr, BC: tl.constexpr,
+                               S_PAD: tl.constexpr, CAUSAL: tl.constexpr):
+    """grid = (splits, num_kv_heads)。batch=1、n_q==1（见 host 端分发）。
+
+    阶段 1：每个 program 负责一个 kv head 的 kv [lo, hi) 段，一次性载入该组
+    全部 g 个 q head（GNQ = g*n_q 行，q 内存中连续）与同一份 K/V 做
+    attention（K/V 只从 HBM 读一次），partial (o, m, l)（dtype 随输入）
+    写入全局暂存。
+    阶段 2：组内最后一个完成 partial 的 program（atomic 计数）负责
+    log-sum-exp 合并、归一化写出，并复位计数器。
+    """
+    s_id = tl.program_id(0)
+    bhk = tl.program_id(1)
+
+    k_base = k_ptr + bhk * kc_stride_h
+    v_base = v_ptr + bhk * vc_stride_h
+
+    GNQ = g * n_q
+    row0 = bhk * GNQ
+    q_desc = tl.make_tensor_descriptor(q_ptr, shape=[bhn, D], strides=[D, 1],
+                                       block_shape=[M_PAD, D])
+    q = q_desc.load([row0, 0])  # 超过 GNQ 的 padding 行自动补零
+
+    lo = s_id * chunk
+    hi = tl.minimum(n_kv, lo + chunk)
+
+    # 中间量精度随输入（bf16 输入 -> bf16）
+    o = tl.zeros([M_PAD, D], dtype=q.dtype)
+    l = tl.zeros([M_PAD], dtype=q.dtype)
+    m = tl.full([M_PAD], float("-inf"), dtype=q.dtype)
+
+    offset = n_kv - n_q
+    rows = tl.arange(0, M_PAD)
+    r_local = rows % n_q
+    d_offs = tl.arange(0, D)
+
+    for j0 in range(lo, hi, BC):
+        cols = j0 + tl.arange(0, BC)
+        cvalid = cols < hi
+        lb = cols // BS
+        slot = cols % BS
+        pb = tl.load(bt_ptr + lb, mask=cvalid, other=0).to(tl.int64)
+        k = tl.load(k_base + pb[:, None] * kc_stride_b
+                    + slot[:, None] * kc_stride_s + d_offs[None, :],
+                    mask=cvalid[:, None], other=0.0)
+        # 16bit 输入的 dot 输出恒为 fp32，显式转回
+        s = (tl.dot(q, tl.trans(k)) * qk_scale).to(q.dtype)
+        mask = cvalid[None, :]
+        if CAUSAL:
+            mask = mask & (cols[None, :] <= (r_local + offset)[:, None])
+        s = tl.where(mask, s, float("-inf"))
+        m_new = tl.maximum(m, tl.max(s, axis=1))
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.math.exp2(m - m_safe).to(q.dtype)
+        p = tl.math.exp2(s - m_safe[:, None]).to(q.dtype)
+        l = l * alpha + tl.sum(p, axis=1)
+        v = tl.load(v_base + pb[:, None] * vc_stride_b
+                    + slot[:, None] * vc_stride_s + d_offs[None, :],
+                    mask=cvalid[:, None], other=0.0)
+        o = o * alpha[:, None] + tl.dot(p.to(v.dtype), v).to(q.dtype)
+        m = m_new.to(q.dtype)
+
+    pid = bhk * splits + s_id
+    valid = rows < GNQ
+    tl.store(op_ptr + (pid * GNQ + rows)[:, None] * D + d_offs[None, :],
+             o.to(op_ptr.dtype.element_ty), mask=valid[:, None])
+    tl.store(mp_ptr + pid * GNQ + rows, m, mask=valid)
+    tl.store(lp_ptr + pid * GNQ + rows, l, mask=valid)
+
+    # ---- 阶段 2：组内最后一个 program 做 merge ----
+    tl.debug_barrier()
+    old = tl.atomic_add(cnt_ptr + bhk, 1, sem="acq_rel", scope="gpu")
+    if old == splits - 1:
+        sids = tl.arange(0, S_PAD)
+        smask = (sids < splits)[:, None] & valid[None, :]
+        pids = bhk * splits + sids
+        m_all = tl.load(mp_ptr + pids[:, None] * GNQ + rows[None, :],
+                        mask=smask, other=float("-inf"))
+        l_all = tl.load(lp_ptr + pids[:, None] * GNQ + rows[None, :],
+                        mask=smask, other=0.0)
+        m_star = tl.max(m_all, axis=0)
+        m_gsafe = tl.where(m_star == float("-inf"), 0.0, m_star)
+        w_all = tl.math.exp2(m_all - m_gsafe[None, :]).to(q.dtype)
+        l_g = tl.sum(l_all * w_all, axis=0)
+
+        o_g = tl.zeros([M_PAD, D], dtype=q.dtype)
+        for sid in range(splits):
+            pid2 = bhk * splits + sid
+            m_s = tl.load(mp_ptr + pid2 * GNQ + rows, mask=valid,
+                          other=float("-inf"))
+            w = tl.math.exp2(m_s - m_gsafe).to(q.dtype)
+            o_s = tl.load(op_ptr + (pid2 * GNQ + rows)[:, None] * D
+                          + d_offs[None, :], mask=valid[:, None], other=0.0)
+            o_g += w[:, None] * o_s
+
+        o_g = o_g / l_g[:, None]  # l_g==0 只在 valid=False 的 padding 行
+        tl.store(o_ptr + (row0 + rows)[:, None] * D + d_offs[None, :],
+                 o_g.to(o_ptr.dtype.element_ty), mask=valid[:, None])
+        tl.store(cnt_ptr + bhk, 0)  # 复位供下一次调用
+
+
+# ============================================================================
+# host 端
+# ============================================================================
+_DECODE_SCRATCH = {}
+_N_SM = [None]
+
+
+def _decode_scratch(BHK, splits, GNQ, d, device, dtype):
+    key = (BHK, splits, GNQ, d, device, dtype)
+    if len(_DECODE_SCRATCH) > 32:
+        _DECODE_SCRATCH.clear()
+    if key not in _DECODE_SCRATCH:
+        o_part = torch.empty(BHK * splits * GNQ * d, device=device, dtype=dtype)
+        m_part = torch.empty(BHK * splits * GNQ, device=device, dtype=dtype)
+        l_part = torch.empty(BHK * splits * GNQ, device=device, dtype=dtype)
+        cnt = torch.zeros(BHK, device=device, dtype=torch.int32)
+        _DECODE_SCRATCH[key] = (o_part, m_part, l_part, cnt)
+    return _DECODE_SCRATCH[key]
+
+
+def _decode_one(q_s, k_cache, v_cache, o_s, bt_s, n_kv, qk_scale):
+    """单条请求的 decode（n_q == 1）。q_s/o_s: [1, h, d] 视图。"""
+    h = q_s.shape[1]
+    h_kv = k_cache.shape[1]
+    g = h // h_kv
+    d = q_s.shape[2]
+    bs = k_cache.shape[2]
+    GNQ = g  # n_q = 1
+    M_PAD = max(16, triton.next_power_of_2(GNQ))
+    BHK = h_kv
+    if _N_SM[0] is None:
+        _N_SM[0] = torch.cuda.get_device_properties(q_s.device).multi_processor_count
+    # 确定性 splits 启发式：目标 program 数 ≈ 4x SM 数
+    # （H20、n_kv~95k 实测 splits∈[27,39] 最优 ~1.78 TB/s，取 4x SM）
+    cap = min(triton.cdiv(n_kv, 256), 64)
+    splits = min(max(triton.cdiv(4 * _N_SM[0], BHK), 1), cap)
+    chunk = triton.cdiv(triton.cdiv(n_kv, splits), 128) * 128
+    sp = triton.cdiv(n_kv, chunk)
+    o_part, m_part, l_part, cnt = _decode_scratch(BHK, sp, GNQ, d,
+                                                  q_s.device, q_s.dtype)
+    _paged_decode_fused_kernel[(sp, BHK)](
+        q_s, k_cache, v_cache, o_s,
+        o_part, m_part, l_part, cnt, bt_s,
+        h, 1, n_kv, h_kv, g, qk_scale, chunk, sp,
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        D=d, BS=bs, M_PAD=M_PAD, S_PAD=64, CAUSAL=True)
+
+
+def _prefill_one(q_s, k_cache, v_cache, o_s, bt_s, n_q, n_kv, qk_scale):
+    """单条请求的 prefill（任意 n_q）。q_s/o_s: [n_q, h, d] 视图。"""
+    h = q_s.shape[1]
+    h_kv = k_cache.shape[1]
+    g = h // h_kv
+    d = q_s.shape[2]
+    bs = k_cache.shape[2]
+    grid = lambda meta: (triton.cdiv(n_q, meta['BR']), h)
+    _paged_prefill_kernel[grid](
+        q_s, k_cache, v_cache, o_s, bt_s,
+        q_s.stride(1), q_s.stride(0),
+        o_s.stride(1), o_s.stride(0),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        n_q, n_kv, h, g, qk_scale,
+        D=d, BS=bs, CAUSAL=True)
+
+
+# decode 走 split-K 内核的最小 context 长度（短 context 用 prefill 内核更划算）
+_DECODE_MIN_KV = 1024
+
+
+# 可选的 CPU 元数据侧通道（避免每次调用对 GPU 张量 .tolist() 造成 64 次/步的
+# 流同步，从而让 host 端 Python/launch 开销与 GPU 计算重叠）。
+# 由 CustomTritonImpl.forward 在调用前设置；未设置时回退为 .tolist()。
+_CPU_META = None
+
+
+def set_cpu_metadata(query_start_loc_cpu, seq_lens_cpu) -> None:
+    """预置本步的 CPU 侧元数据（list）。任一参数为 None 时清除。"""
+    global _CPU_META
+    if query_start_loc_cpu is None or seq_lens_cpu is None:
+        _CPU_META = None
+    else:
+        _CPU_META = (query_start_loc_cpu.tolist(), seq_lens_cpu.tolist())
 
 
 def paged_attention_triton(
@@ -134,40 +398,35 @@ def paged_attention_triton(
     scale: float,
 ) -> torch.Tensor:
     """
-    分页注意力（causal, GQA, prefill+decode 通用）。
+    分页注意力（causal, GQA, prefill+decode 通用）。output 原地写入并返回。
 
-    这是【接口约定】：学生把自己的 kernel 实现成同样的签名与语义即可替换。
-    - causal：每个 query token 只能看到不超过自身绝对位置的 KV。
-    - GQA：num_heads 可以是 num_kv_heads 的整数倍，Q 头映射到共享的 KV 头。
-    - output 原地写入并返回。
+    按请求逐条分发：n_q == 1 且 context 较长 -> split-K decode 内核；
+    其余 -> prefill 内核（causal 时 query 对齐到 kv 末尾，语义一致）。
     """
     num_tokens, num_heads, head_size = query.shape
+    if num_tokens == 0:
+        return output
     num_kv_heads = key_cache.shape[1]
-    block_size = key_cache.shape[2]
-    max_num_blocks = block_table.shape[1]
+    g = num_heads // num_kv_heads
+    qk_scale = scale * 1.4426950408889634  # 乘入 log2(e)，kernel 内用 exp2
 
-    grid = (num_tokens, num_heads)
-    _paged_attn_kernel[grid](
-        output,
-        query,
-        key_cache,
-        value_cache,
-        query_start_loc,
-        seq_lens,
-        token_seq_idx,
-        block_table,
-        scale,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        HEAD_SIZE=head_size,
-        BLOCK_SIZE=block_size,
-        max_num_blocks=max_num_blocks,
-        q_stride_t=query.stride(0), q_stride_h=query.stride(1),
-        o_stride_t=output.stride(0), o_stride_h=output.stride(1),
-        kc_stride_b=key_cache.stride(0), kc_stride_h=key_cache.stride(1),
-        kc_stride_s=key_cache.stride(2),
-        vc_stride_b=value_cache.stride(0), vc_stride_h=value_cache.stride(1),
-        vc_stride_s=value_cache.stride(2),
-        block_table_stride=block_table.stride(0),
-    )
+    if _CPU_META is not None:
+        qsl, sls = _CPU_META
+    else:
+        qsl = query_start_loc.tolist()
+        sls = seq_lens.tolist()
+    for s in range(len(sls)):
+        qs, qe = qsl[s], qsl[s + 1]
+        n_q = qe - qs
+        n_kv = sls[s]
+        if n_q <= 0:
+            continue
+        bt_s = block_table[s]
+        q_s = query[qs:qe]
+        o_s = output[qs:qe]
+        if n_q == 1 and n_kv >= _DECODE_MIN_KV and g <= 128:
+            _decode_one(q_s, key_cache, value_cache, o_s, bt_s, n_kv, qk_scale)
+        else:
+            _prefill_one(q_s, key_cache, value_cache, o_s, bt_s, n_q, n_kv,
+                         qk_scale)
     return output
