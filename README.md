@@ -221,6 +221,22 @@ pass@1 = 145/164 = 0.8841  (88.41%)
 1. 用这个自定义后端能**正常启动模型**并给出**正确**回答；
 2. 里面的 Triton attention 是个**可替换的示例**——你只要让自己的 kernel 满足同样的接口，就能替换它、接进 vLLM。
 
+> ## ✅ 半天就能接入你已有的 kernel（已实测验证）
+>
+> **如果你已经写好了 attention kernel（例如 [`attention-test`](https://github.com/fvvluo/attention-test) 里的实现），接入 vLLM 只需改 1 个文件的 1 个函数。**
+>
+> 我们已经**端到端验证过**：把 `attention-test` 的参考 kernel（签名 `attention(q,k,v,causal,sm_scale)`、形状 `(batch,heads,seq,dim)`）按 [**2.5 的适配器模板**](#25-把你已有的-kernel-接进来半天冲刺版--照着做)填进去，正确性测试**直接三项全过**：
+>
+> ```
+> [prefill] max_abs_err=2.09e-02  -> PASS
+> [decode]  max_abs_err=1.11e-02  -> PASS
+> [mixed]   max_abs_err=2.22e-02  -> PASS
+> ================================================
+> ALL PASS
+> ```
+>
+> 也就是说 **2.5 给的模板是照抄就能跑通的**（不是伪代码）。时间紧的话，**可以直接跳到 [Part 2.5](#25-把你已有的-kernel-接进来半天冲刺版--照着做)** 照着做；2.1~2.4 是背景原理，先接入、后细看也行。
+
 ### 2.1 代码结构
 
 自定义后端放在 `custom_backend/` 包里：
@@ -418,6 +434,8 @@ def paged_attention_triton(query, key_cache, value_cache, output,
 > - 你的 kernel 用 `(kv_len - q_len + i)` 做 causal 对齐（见 `_example_flash_attention.py`），正好等于 vLLM 里 `context_len + i` 的绝对位置——所以 **decode（q_len=1、L=完整长度）也能直接跑通**，无需额外处理。
 > - `sm_scale` 直接传 vLLM 给的 `scale`（就是 `1/sqrt(head_size)`），别再让 kernel 用默认 `None`，否则可能双重缩放。
 > - GQA 的 head 展开（`repeat_interleave`）在**你 kernel 内部**做，这里不用管。
+
+> ✅ **本模板已实测**：用 `attention-test` 的参考 kernel 套用上面这段，`tests/test_paged_attn_correctness.py` 三项（prefill/decode/mixed）全部 PASS。照抄即可，不用怀疑对错。
 
 #### 第 3 步：跑通三连（每步都有预期输出，照着比对）
 
