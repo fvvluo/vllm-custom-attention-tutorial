@@ -15,6 +15,8 @@
 > 2. **`performance.png`** —— 跑 [Part 4.2 性能测试](#42-评测你自己-kernel-的-e2e-分数一条命令) `scripts/perf_test.py`（默认参数：`--input-len 100000 --output-len 64`）的输出截图，须显示 `E2E 评分` 与最后一行 `[perf] SUMMARY ...`。
 >
 > **正确性是性能的前提**：`correctness.png` 必须先 `ALL PASS`，`performance.png` 的分数才有效——否则近似/丢 KV 的 kernel（如 sparse attention）可以只刷速度而不保证结果正确。两张图一起看，速度分才算数。
+>
+> ⚠️ **正确性只以 [Part 3](#part-3分页注意力正确性检测) 的 `test_paged_attn_correctness.py` 为准**。教程里还有另外两个“验证”只是**辅助自检、不是评分依据**：Part 1.3 / 2.4 的**冒烟测试**（`smoke_test.py`，只问一道 `17+25` 看服务通不通）、Part 1.4 的 **HumanEval**（跑通演示用）。别拿这两个当正确性凭证。
 
 ---
 
@@ -316,7 +318,9 @@ Application startup complete.
 
 > **注意性能**：这个教学 kernel 是“每个 query token 一个 Triton program”的朴素实现，只求正确、不求快。在 eager 模式下逐 token 生成会比较慢，因此下面的验证用**关闭思考链**的短请求。
 
-### 2.4 验证正确性
+### 2.4 验证正确性（仅冒烟自检，非评分）
+
+> 这里的冒烟测试只是**快速自检**：确认换上你的 kernel 后服务还能正常起、能算对一道简单题。**它不是正确性评分依据**——正式的正确性判定以 [Part 3](#part-3分页注意力正确性检测) 的 `test_paged_attn_correctness.py`（`ALL PASS`）为准。
 
 在**第二个终端**跑同一个冒烟测试：
 
@@ -469,6 +473,12 @@ PYTHONPATH=../vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32
 ## Part 3：分页注意力正确性检测
 
 Part 2 里的 Triton attention 直接**接收分页 KV cache（paged KV cache）作为输入**。我们把它当作 **baseline**：你实现自己的 kernel 后，用同一份测试就能方便地校验正确性——无需启动整个 32B 服务。
+
+> ✅ **这是正确性的唯一评判标准**（要交的 `correctness.png` 就来自这里）。它直接把你 kernel 的输出与 PyTorch 参考实现**逐元素比对**，数值级精确、秒级、离线，`sparse` 等近似 kernel 在这里必然 FAIL。
+>
+> 对比另外两个"验证"——它们**只是辅助，不能替代本测试**：
+> - **冒烟测试**（1.3 / 2.4，`smoke_test.py`）：只问一道 `17+25` 看服务通不通，1 道题、蒙对也算过，**只证明"服务能跑"，不证明"kernel 算对"**。
+> - **HumanEval**（1.4）：164 题 pass@1，是**教学演示**（展示后端算错时分数会崩），慢且依赖整个模型，**不作评分门槛**。
 
 ### 3.1 接口约定（你的 kernel 要满足的签名）
 
