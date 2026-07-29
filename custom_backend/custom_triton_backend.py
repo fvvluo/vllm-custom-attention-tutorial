@@ -43,6 +43,18 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from .triton_attention import paged_attention_triton
 
+# Select the attention implementation used by CustomTritonImpl.forward.
+#   WZC_SPARSE_BACKEND=1  -> wzc block-level top-k sparse prefill kernel adapter
+#                            (falls back to torch for decode / ragged requests);
+#   otherwise             -> the tutorial's simple Triton kernel (default).
+# Both satisfy the same paged_attention_* signature (README Part 3).
+import os as _os
+
+if _os.environ.get("WZC_SPARSE_BACKEND") == "1":
+    from .wzc_sparse_attention import paged_attention_wzc as _paged_attention_fn
+else:
+    _paged_attention_fn = paged_attention_triton
+
 
 # ============================================================================
 # 1. 本后端使用的 attention 元数据
@@ -239,7 +251,7 @@ class CustomTritonImpl(AttentionImpl):
         # 的写入位置一致。
         # output 传成 [num_tokens, num_heads, head_size] 视图供原地写入。
         out_view = output[:num_actual_tokens].view(-1, self.num_heads, hs)
-        paged_attention_triton(
+        _paged_attention_fn(
             query=query[:num_actual_tokens],
             key_cache=key_cache,
             value_cache=value_cache,
