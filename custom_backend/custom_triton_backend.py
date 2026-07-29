@@ -30,6 +30,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionImpl,
     AttentionLayer,
     AttentionMetadataBuilder,
@@ -40,6 +41,7 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.platforms import current_platform
 
 from .triton_attention import paged_attention_triton
 
@@ -56,13 +58,20 @@ class CustomTritonMetadata:
     slot_mapping: torch.Tensor      # [num_actual_tokens]
     token_seq_idx: torch.Tensor     # [num_actual_tokens] 每 token 属于哪条请求
     causal: bool | torch.Tensor
+    # 由 build() 用 common_attn_metadata.max_query_len（host int）预算，避免 forward 里 .item()
+    # 触发 GPU 同步而破坏 CUDA graph 捕获。True=prefill/chunked，False=纯 decode(可被 graph 捕获)。
+    is_prefill: bool = False
 
 
 # ============================================================================
 # 2. 元数据 Builder：把 vLLM 的通用元数据转成本后端所需的元数据
 # ============================================================================
 class CustomTritonMetadataBuilder(AttentionMetadataBuilder[CustomTritonMetadata]):
-    # 默认 _cudagraph_support = NEVER（继承自基类），配合 --enforce-eager。
+    # 支持对**纯 decode（query_len==1）批**做 CUDA graph 捕获——decode 的瓶颈是 64 层逐步
+    # eager launch 开销，开 graph 后能大幅提速；prefill 仍走 eager（不捕获）。
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
 
     def __init__(
         self,
@@ -73,6 +82,8 @@ class CustomTritonMetadataBuilder(AttentionMetadataBuilder[CustomTritonMetadata]
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.device = device
+        # decode 批分组：query_len<=1 的请求会被排到 batch 前部，便于纯 decode 批被 graph 捕获。
+        self._init_reorder_batch_threshold(1)
 
     def build(
         self,
@@ -84,14 +95,16 @@ class CustomTritonMetadataBuilder(AttentionMetadataBuilder[CustomTritonMetadata]
         num_actual_tokens = common_attn_metadata.num_actual_tokens
 
         # 预计算 token -> 请求 的映射，供 Triton kernel 直接读取。
-        # query_start_loc: [0, len0, len0+len1, ...]，用 searchsorted 得到每个 token 的请求下标。
         token_ids = torch.arange(
             num_actual_tokens, device=query_start_loc.device, dtype=torch.int32
         )
-        # 右边界减一：token 落在 [start_i, start_{i+1}) -> 请求 i
         token_seq_idx = (
             torch.searchsorted(query_start_loc[1:], token_ids, right=True)
         ).to(torch.int32)
+
+        # 用 common_attn_metadata.max_query_len（host int，无 GPU 同步）预判 prefill/decode，
+        # forward 直接读该 bool，避免捕获路径里 .item() 同步。
+        is_prefill = common_attn_metadata.max_query_len > 1
 
         return CustomTritonMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -101,7 +114,18 @@ class CustomTritonMetadataBuilder(AttentionMetadataBuilder[CustomTritonMetadata]
             slot_mapping=common_attn_metadata.slot_mapping,
             token_seq_idx=token_seq_idx,
             causal=common_attn_metadata.causal,
+            is_prefill=is_prefill,
         )
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> CustomTritonMetadata:
+        # 捕获期只针对纯 decode 批（max_query_len==1）。参考 triton_attn：把 seq_lens 填 1
+        # 避免按 max_model_len 捕获时极慢。
+        m = self.build(0, common_attn_metadata)
+        m.seq_lens.fill_(1)
+        m.is_prefill = False
+        return m
 
 
 # ============================================================================
@@ -113,7 +137,13 @@ class CustomTritonBackend(AttentionBackend):
         torch.float16,
         torch.bfloat16,
     ]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto"]
+    # auto = 与模型同 dtype（bf16）；fp8/fp8_e4m3 = KV cache 预量化为 e4m3 常驻，
+    # 每字节减半（decode 带宽红利），且 K/V 只在写入时量化一次、读时直接用 fp8。
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "fp8",
+        "fp8_e4m3",
+    ]
 
     # 关键：forward 内部自己负责写 KV cache（写 + 读一体）。
     forward_includes_kv_cache_update: bool = True
@@ -213,15 +243,25 @@ class CustomTritonImpl(AttentionImpl):
         # 最省心的做法：不用关心底层是 NHD 还是 HND，只按 stride 索引即可。
         key_cache, value_cache = kv_cache.split(hs, dim=-1)
 
+        # ---- FP8 KV cache（预量化 e4m3 常驻）----
+        # --kv-cache-dtype fp8 时：vLLM 把 cache 分配为 fp8（每字节减半），
+        # reshape_and_cache 在写入时按 layer._k_scale/_v_scale 把 K/V 量化成 e4m3
+        # 存进去（**只量化一次**）；kernel 读时直接用 fp8、再乘回 descale 恢复量级。
+        # 这样 decode 每步从 HBM 搬的 KV 字节减半、且不必每步重量化——fp8 在 decode
+        # 真正省带宽的地方。
+        is_fp8_kv = self.kv_cache_dtype.startswith("fp8")
+        if is_fp8_kv:
+            fp8_dtype = current_platform.fp8_dtype()
+            if key_cache.dtype != fp8_dtype:
+                key_cache = key_cache.view(fp8_dtype)
+                value_cache = value_cache.view(fp8_dtype)
+
         # ---- 1. 把本次新的 K/V 写入分页 KV cache ----
-        # 复用 vLLM 现成的 triton_reshape_and_cache_flash 写入（这一步是“写缓存”，
-        # 不是 attention 计算本身；学生要替换的是下面第 2 步的 attention kernel）。
-        #
-        # 注意：triton_reshape_and_cache_flash 约定 cache 形状是
-        #   [num_blocks, block_size, num_heads, head_size]（即 slot 维在前、head 维在后），
-        # 而我们的视图是 (num_blocks, num_kv_heads, block_size, hs)（head 维在前）。
-        # 该 op 完全按 stride 寻址，因此只要把 head/slot 两维 transpose 一下，
-        # 传进去的“逻辑形状”就与它的约定一致，物理写入位置保持正确。
+        # 复用 vLLM 现成的 triton_reshape_and_cache_flash 写入。该 op 在
+        # kv_cache_dtype 为 fp8 时会用 k_scale/v_scale 把 K/V 量化成 e4m3 存入。
+        # 注意：它约定 cache 形状是 [num_blocks, block_size, num_heads, head_size]
+        # （slot 维在前），我们的视图是 head 维在前，故把 head/slot transpose 一下；
+        # 完全按 stride 寻址，物理写入位置保持正确。
         triton_reshape_and_cache_flash(
             key[:num_actual_tokens],
             value[:num_actual_tokens],
@@ -234,10 +274,8 @@ class CustomTritonImpl(AttentionImpl):
         )
 
         # ---- 2. 调用（学生可替换的）Triton 分页注意力 ----
-        # 这里用回 HND 形状的视图 (num_blocks, num_kv_heads, block_size, hs)，
-        # 我们的 kernel 按 stride(0/1/2) 分别取 block/head/slot，读取位置与上面
-        # 的写入位置一致。
-        # output 传成 [num_tokens, num_heads, head_size] 视图供原地写入。
+        # fp8 KV cache 时把 per-tensor descale（k_scale/v_scale 标量）传给 kernel，
+        # 让它把读到的 fp8 K/V 乘回真实量级；auto(bf16) 时 descale=None。
         out_view = output[:num_actual_tokens].view(-1, self.num_heads, hs)
         paged_attention_triton(
             query=query[:num_actual_tokens],
@@ -249,5 +287,9 @@ class CustomTritonImpl(AttentionImpl):
             token_seq_idx=attn_metadata.token_seq_idx,
             block_table=attn_metadata.block_table,
             scale=self.scale,
+            k_descale=(layer._k_scale if is_fp8_kv else None),
+            v_descale=(layer._v_scale if is_fp8_kv else None),
+            # 由 builder 用 max_query_len 预算，避免捕获路径里的 .item() 同步。
+            is_prefill=attn_metadata.is_prefill,
         )
         return output
