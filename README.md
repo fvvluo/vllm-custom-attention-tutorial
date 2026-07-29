@@ -263,7 +263,7 @@ pip install -e .
 
 ```bash
 cd /dockerdata/landojiang/vllm_tutorial
-GPU=0 PORT=8000 bash scripts/serve_qwen3_custom.sh
+GPU=0 PORT=8000 MODEL=/models/Qwen3-32B bash scripts/serve_qwen3_custom.sh
 ```
 
 脚本核心命令（供理解）：
@@ -423,7 +423,7 @@ rope_scaling            = None
 ```bash
 cd /dockerdata/landojiang/vllm_tutorial
 HF_OVERRIDES='{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":40960},"max_position_embeddings":163840}' \
-MAX_LEN=102400 GPU_MEM_UTIL=0.94 GPU=4 PORT=8004 \
+MAX_LEN=102400 GPU_MEM_UTIL=0.94 GPU=0 PORT=8004 MODEL=/models/Qwen3-32B \
 bash scripts/serve_qwen3_flashattn.sh
 ```
 
@@ -524,11 +524,11 @@ E2E(s)    = TTFT + 1000 × TPOT            # 例：111.411 + 1000 × 0.03557 ≈
 ```bash
 # 第一个终端：CUSTOM 后端，小上下文即可（无需 YaRN）
 cd /dockerdata/landojiang/vllm_tutorial
-GPU=5 PORT=8005 bash scripts/serve_qwen3_custom.sh
+GPU=0 PORT=8005 MODEL=/models/Qwen3-32B bash scripts/serve_qwen3_custom.sh
 
 # 第二个终端：用小 --input-len 测（如 2048）
 cd /dockerdata/landojiang/vllm_tutorial
-python scripts/perf_test.py --port 8005 --input-len 2048 --output-len 32
+python scripts/perf_test.py --port 8005 --input-len 2048 --output-len 64
 ```
 
 **预期输出**（单张 H20 实测，仅 ~2k 输入）：

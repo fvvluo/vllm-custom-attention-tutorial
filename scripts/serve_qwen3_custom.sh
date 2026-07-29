@@ -10,16 +10,26 @@
 # =============================================================================
 set -euo pipefail
 
-VLLM_SRC="${VLLM_SRC:-/dockerdata/landojiang/vllm_src}"
+VLLM_SRC="${VLLM_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/vllm_src}"
 MODEL="${MODEL:-/dockerdata/models/Qwen3-32B}"
 SERVED_NAME="${SERVED_NAME:-qwen3-32b}"
 PORT="${PORT:-8000}"
 GPU="${GPU:-0}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
 MAX_LEN="${MAX_LEN:-8192}"
+# 可选：HF config 覆盖（JSON）。跑 100k 长上下文性能测试时用它开 YaRN，把上下文扩到 128k+。
+# 该检查点 config 里 max_position_embeddings=40960（原生 ~40k），要跑 100k 输入需设：
+#   HF_OVERRIDES='{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":40960},"max_position_embeddings":163840}'
+# 并同时把 MAX_LEN 调大（如 102400）。默认不开（短上下文冒烟/正确性无需 YaRN）。
+HF_OVERRIDES="${HF_OVERRIDES:-}"
 
 export CUDA_VISIBLE_DEVICES="${GPU}"
 export PYTHONPATH="${VLLM_SRC}:${PYTHONPATH:-}"
+
+EXTRA_ARGS=()
+if [[ -n "${HF_OVERRIDES}" ]]; then
+    EXTRA_ARGS+=(--hf-overrides "${HF_OVERRIDES}")
+fi
 # CUSTOM 后端通过 pip 安装的 general_plugin 自动注册（见 pyproject.toml）。
 # 教学示例后端不参与 CUDA graph，用 --enforce-eager 关闭 torch.compile / graph 捕获，
 # 路径最简单、最好调试。
@@ -37,4 +47,5 @@ exec python -m vllm.entrypoints.openai.api_server \
     --max-model-len "${MAX_LEN}" \
     --enforce-eager \
     --no-async-scheduling \
-    --attention-backend CUSTOM
+    --attention-backend CUSTOM \
+    "${EXTRA_ARGS[@]}"
