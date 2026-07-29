@@ -325,10 +325,21 @@ PYTHONPATH=../vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32
 
 ### 2.5 把你已有的 kernel 接进来（半天冲刺版 · 照着做）
 
-> 场景：你**手上已经有一个写好的 attention kernel**，现在要在最短时间内接进 vLLM 跑通。
-> **你要做的只有一件事**：打开 `custom_backend/triton_attention.py`，把 `paged_attention_triton(...)`
-> 的**函数体**换成"整理输入 → 调你的 kernel → 把结果写进 `output`"。**函数名和参数列表一个字都别改**，
-> 其它文件全部不用碰。
+> ## 👉 直接告诉你要改哪里
+>
+> **改 1 个文件、1 个函数、其它全部不动：**
+>
+> | | |
+> |---|---|
+> | **改哪个文件** | `custom_backend/triton_attention.py` |
+> | **改哪个函数** | 只改 `paged_attention_triton(...)` 的**函数体**（示例里的 `triton_attention.py:144-173`） |
+> | **怎么改** | 函数体清空，换成 3 行逻辑：**① 把入参整理成你 kernel 的输入 → ② 调你的 kernel → ③ 结果写进 `output` 并 `return output`** |
+> | **绝不能改** | 函数名 `paged_attention_triton`、它的参数列表（顺序/名字）|
+> | **不用碰** | `custom_triton_backend.py`、`plugin.py`、`__init__.py`、`pyproject.toml`，以及文件名本身 |
+> | **示例里的 `_paged_attn_kernel`** | 那是**旧的教学 kernel**，直接删掉或忽略，用不上 |
+> | **你们 `attention-test` 的 kernel** | 签名 `attention(q,k,v,causal,sm_scale)`、形状 `(batch,heads,seq,dim)`，和 vLLM 给的形状不同——[**第 2 步**](#第-2-步套用这个适配器模板已按-attention-test-的-kernel-签名写好)有**已写好、可直接抄**的转换模板 |
+>
+> 改完跑 **第 3 步** 的三条命令，全绿即接入成功。下面第 1、2 步是这张表的展开说明 + 可抄模板。
 
 #### 第 1 步：认清这个函数（唯一的接入点）
 
@@ -355,39 +366,58 @@ def paged_attention_triton(
 - 必须是 **causal**（token 只能看自己及之前的位置）+ **GQA**（`num_heads` 是 `num_kv_heads` 的整数倍，多个 Q 头共享一个 KV 头）。
 - 第 `req` 条请求第 `j` 个位置的 KV 在：`pb = block_table[req, j // block_size]`，槽位 `j % block_size`，即 `key_cache[pb, kv_head, j % block_size, :]`。
 
-#### 第 2 步：套用这个适配器模板
+#### 第 2 步：套用这个适配器模板（已按 `attention-test` 的 kernel 签名写好）
 
-大多数现成 kernel 的输入格式和上面不完全一样（比如你的 kernel 要连续的 `[seq, heads, dim]`、或要 cu_seqlens、或要非分页的 K/V）。**接入的本质 = 在这个函数里做一次"格式转换"**。把下面的骨架抄进 `triton_attention.py`，替换原来的函数体：
+**为什么需要适配**：你们在 [`attention-test`](https://github.com/fvvluo/attention-test) 里写的 kernel 签名是——
 
 ```python
+attention(q, k, v, causal=True, sm_scale=None) -> output
+#  q:      (batch, q_heads,  seq_len, head_dim)
+#  k, v:   (batch, kv_heads, seq_len, head_dim)   # GQA: q_heads 是 kv_heads 整数倍
+#  output: 同 q, (batch, q_heads, seq_len, head_dim)
+```
+
+而 vLLM 传给 `paged_attention_triton` 的是**另一套形状**：query 没有 batch 维、是变长序列拼接的 `[num_tokens, num_heads, head_size]`；KV 是**分页**的 `[num_blocks, num_kv_heads, block_size, head_size]`。**接入 = 在这个函数里把两套形状对接起来**。把下面这段**直接抄进 `triton_attention.py` 替换函数体**（把 `YOUR_ATTENTION` 换成你 import 进来的那个 `attention`）：
+
+```python
+# 顶部先 import 你自己的 kernel，例如：
+# from ops.your_flash_attention import attention as YOUR_ATTENTION
+
 def paged_attention_triton(query, key_cache, value_cache, output,
                            query_start_loc, seq_lens, token_seq_idx,
                            block_table, scale):
-    # ==== 在这里把 vLLM 的分页输入，整理成你的 kernel 需要的格式 ====
-    # 例：逐条请求，用 block_table 把分页 KV 还原成连续 [seq_len, num_kv_heads, head_size]
     num_seqs = seq_lens.shape[0]
     block_size = key_cache.shape[2]
     for i in range(num_seqs):
         s, e = int(query_start_loc[i]), int(query_start_loc[i + 1])   # 本请求 query 区间
-        q_i = query[s:e]                                              # [q_len, num_heads, hs]
-        L = int(seq_lens[i])                                          # 该请求总长度
-        # 用 block_table 收集该请求的前 L 个 KV（gather 出连续 K/V）
+        L = int(seq_lens[i])                                          # 该请求总长度(含历史)
+
+        # 1) 用 block_table 把分页 KV gather 成连续序列 [L, num_kv_heads, head_size]
         blocks = block_table[i]
-        k_i = torch.cat([key_cache[blocks[j // block_size], :, j % block_size, :].unsqueeze(0)
-                         for j in range(L)], dim=0)                   # [L, num_kv_heads, hs]
-        v_i = torch.cat([value_cache[blocks[j // block_size], :, j % block_size, :].unsqueeze(0)
-                         for j in range(L)], dim=0)
+        rows = torch.arange(L, device=key_cache.device)
+        pb = blocks[rows // block_size]                               # 每个位置的物理块号
+        slot = rows % block_size
+        k_i = key_cache[pb, :, slot, :]                               # [L, num_kv_heads, hs]
+        v_i = value_cache[pb, :, slot, :]
 
-        # ==== 调用你自己的 kernel（causal、GQA、scale）====
-        out_i = YOUR_KERNEL(q_i, k_i, v_i, scale=scale, causal=True)  # 返回 [q_len, num_heads, hs]
+        # 2) 转成你 kernel 要的 (batch=1, heads, seq, dim)
+        q_i = query[s:e].transpose(0, 1).unsqueeze(0)                 # [1, num_heads,  q_len, hs]
+        k_i = k_i.transpose(0, 1).unsqueeze(0)                        # [1, num_kv_heads, L,   hs]
+        v_i = v_i.transpose(0, 1).unsqueeze(0)
 
-        # ==== 把结果写回 output（原地）====
-        output[s:e] = out_i
+        # 3) 调你的 kernel（causal + GQA 已由 kernel 内部处理，scale 用 vLLM 给的）
+        out_i = YOUR_ATTENTION(q_i, k_i, v_i, causal=True, sm_scale=scale)
+        #        out_i: [1, num_heads, q_len, hs]
+
+        # 4) 变回 [q_len, num_heads, hs] 写回 output（原地）
+        output[s:e] = out_i.squeeze(0).transpose(0, 1)
     return output
 ```
 
-> 上面的 `for` 循环 + `torch.cat` 只是**最省事的正确写法**（先跑通、先过正确性测试）。等 2.5 跑通、Part 3 正确性 PASS 后，再回来把它换成你 kernel 的高效分页/批量实现来冲性能（Part 4）。
-> 如果你的 kernel **本身就支持分页 KV cache**（直接吃 `block_table`），那更简单：直接把 `key_cache/value_cache/block_table/query_start_loc/seq_lens` 传给它，连 gather 都省了。
+> **对齐要点（照抄即可，不用自己推）**：
+> - 你的 kernel 用 `(kv_len - q_len + i)` 做 causal 对齐（见 `_example_flash_attention.py`），正好等于 vLLM 里 `context_len + i` 的绝对位置——所以 **decode（q_len=1、L=完整长度）也能直接跑通**，无需额外处理。
+> - `sm_scale` 直接传 vLLM 给的 `scale`（就是 `1/sqrt(head_size)`），别再让 kernel 用默认 `None`，否则可能双重缩放。
+> - GQA 的 head 展开（`repeat_interleave`）在**你 kernel 内部**做，这里不用管。
 
 #### 第 3 步：跑通三连（每步都有预期输出，照着比对）
 
