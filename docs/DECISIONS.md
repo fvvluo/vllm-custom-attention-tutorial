@@ -85,3 +85,16 @@ NOT directly reusable:
 Conclusion: the numerical core (MMA attention + online softmax + LSE combine)
 transfers; the memory addressing / batching / scheduling layer must be rewritten
 for the paged, packed-token interface. No port done this phase (analysis only).
+
+## D6. V2 timing convention (Phase V2.1)
+- unique-KV GB/s uses TOTAL K+V bytes: 2*sum(seq_len)*Hkv*D*2(bf16). 128K K+V=512 MiB.
+- Continuous B5/B7 under this convention: B5≈1.81 TB/s, B7≈2.88 TB/s (128K).
+- End-to-end V2 timing includes the per-call lse.fill_(-inf) reset (honest);
+  Stage-1-only / combine-only are measured via build_v2_runners with pre-reset
+  workspace to isolate kernel cost. Stage-1+combine != end-to-end exactly (each
+  has independent launch/event overhead).
+- Best 128K split = 256 (num_splits=512, 4 tiles/CTA). combine ~0.3%, Stage-1 ~99%.
+- block_table lookup is NOT claimed negligible — only "not a dominant bottleneck",
+  pending cleaner profiling (shared-GPU contention contaminated 32768 identity run).
+- V3 (cp.async) is justified: V2 sync load ≈167 GB/s << HBM roofline; overlap
+  should close the gap toward B6/B7-style utilization.
