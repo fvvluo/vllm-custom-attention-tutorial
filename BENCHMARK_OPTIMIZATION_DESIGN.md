@@ -404,6 +404,15 @@ tau=1==dense 逐位无损（`_test_sparse_rect.py`/`test_wzc_chunked.py`：ctx=0
   这不是 prefill/attention 问题，是 **decode 路径在 100k context 下的适配器开销**（疑似 block_size≠128
   时每步 gather+repack 95k 历史，或 piecewise 下 decode 仍有大量非图开销）。→ 下一步诊断 TPOT。
 
+**TPOT 根因 + 修复（2026-07-29）**：根因证实——vLLM 默认 `block_size=16`，而适配器 decode 的
+零拷贝路径要求 `block_size==128`；否则走 `_decode_one` 慢路径，**每 token gather+repack 整段 ~95k
+历史进 128-page pool**（O(context) 拷贝）→ TPOT 260ms。**修复**：`CustomTritonBackend` 加
+`get_supported_kernel_block_sizes`，在 `WZC_SPARSE_BACKEND=1` 时返回 `[128]`，vLLM
+`get_preferred_block_size` 遂选 128（默认 16 不被 128 整除→取 min=128），KV cache 物理页布局直接
+等于 kernel 的 128-page pool → decode 走 `_decode_one_zerocopy`（零拷贝）。已代码验证（wzc on:
+16→128；wzc off: 保持 16，教学默认路径不受影响）。**100k 重测待 GPU 空闲**（预期 TPOT 从 260ms
+回落到 A1 量级 ~40ms → E2E 从 395s 进一步降到 ~135+40=~175s 级别）。
+
 
 - **动作（按依赖排序）**：
   1. **B.0 修回退显存安全**（先做，小改动）：`_torch_causal_gqa` 的 einsum 分块（over q-rows 或
