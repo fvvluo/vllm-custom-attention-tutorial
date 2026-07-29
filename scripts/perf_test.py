@@ -246,12 +246,12 @@ def main() -> int:
           + ("   ⚠️ 已被 --baseline-e2e 覆盖，非官方值，加速比无效！" if baseline_tampered
              else "   （= 官方值，未改动）"))
     if speedup is not None:
-        print(f"加速比          : {speedup:.2f}x   <- baseline {args.baseline_e2e:.1f}s / 本次 {e2e_score_s:.1f}s "
+        print(f"加速比          : {speedup:.4f}x   <- baseline {args.baseline_e2e:.1f}s / 本次 {e2e_score_s:.1f}s "
               f"({'比 baseline 快' if speedup >= 1 else '比 baseline 慢'})"
               + ("  [基于非官方 baseline，无效]" if baseline_tampered else ""))
     print("=" * 64)
     # 一行机器可读汇总，便于把两个后端结果对比
-    speedup_str = f" speedup={speedup:.2f}x" if speedup is not None else ""
+    speedup_str = f" speedup={speedup:.4f}x" if speedup is not None else ""
     print(f"[perf] SUMMARY input={actual_len} out={med_out} "
           f"ttft_s={med_ttft:.3f} tpot_ms={tpot_s * 1000:.2f} decode_tps={med_tps:.1f} "
           f"total_s={med_total:.3f} e2e_score_s={e2e_score_s:.3f} "

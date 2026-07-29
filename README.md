@@ -612,9 +612,9 @@ E2E 评分        : 146.981 s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到�
 ----------------------------------------------------------------
 官方 baseline   : 147.0 s   <- flash_attn 单张 H20 实测，评分基准
 本次所用 baseline: 147.0 s   （= 官方值，未改动）
-加速比          : 1.00x   <- baseline 147.0s / 本次 147.0s (比 baseline 快)
+加速比          : 1.0001x   <- baseline 147.0s / 本次 147.0s (比 baseline 快)
 ================================================================
-[perf] SUMMARY input=95653 out=24 ttft_s=111.411 tpot_ms=35.57 decode_tps=28.1 total_s=112.269 e2e_score_s=146.981 baseline_e2e_s=147.0 speedup=1.00x
+[perf] SUMMARY input=95653 out=24 ttft_s=111.411 tpot_ms=35.57 decode_tps=28.1 total_s=112.269 e2e_score_s=146.981 baseline_e2e_s=147.0 speedup=1.0001x
 ```
 
 > **为什么是 ~95653 而不是 100000？** `--input-len 100000` 是**目标**长度；脚本用 Qwen3 tokenizer
@@ -642,7 +642,7 @@ E2E 评分        : 146.981 s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到�
 python scripts/perf_test.py --port 8004 --input-len 100000 --output-len 64
 ```
 
-脚本会**自动输出** E2E 分数**和加速比**（下面是 flash_attn baseline 自己的值，所以加速比是 1.00x）：
+脚本会**自动输出** E2E 分数**和加速比**（下面是 flash_attn baseline 自己的值，所以加速比≈1.0001x）：
 
 ```
 TTFT (中位数)   : 111.411 s
@@ -651,7 +651,7 @@ E2E 评分        : 146.981 s   <- TTFT + 1000×TPOT
 ----------------------------------------------------------------
 官方 baseline   : 147.0 s   <- flash_attn 单张 H20 实测，评分基准
 本次所用 baseline: 147.0 s   （= 官方值，未改动）
-加速比          : 1.00x   <- baseline 147.0s / 本次 146.981s
+加速比          : 1.0001x   <- baseline 147.0s / 本次 146.981s
 ```
 
 **评分口径统一为 `E2E = TTFT + 1000 × TPOT`**（越低越好）、**加速比 = `官方 baseline 147s / 你的 E2E`**（>1 即比 baseline 快，脚本已自动算好，不用手算）。E2E 同时惩罚 prefill 慢（TTFT 高）和 decode 慢（TPOT 高），一个数就能公平比较不同 kernel。想核对可手算：
@@ -659,7 +659,7 @@ E2E 评分        : 146.981 s   <- TTFT + 1000×TPOT
 ```
 TPOT(s)   = 1 / decode_tps                # 例：1 / 28.1 ≈ 0.03557 s = 35.57 ms
 E2E(s)    = TTFT + 1000 × TPOT            # 例：111.411 + 1000 × 0.03557 ≈ 146.98 s
-加速比     = 147 / E2E                     # 例：147 / 146.98 ≈ 1.00x
+加速比     = 147 / E2E                     # 例：147 / 146.98 ≈ 1.0001x（四位小数）
 ```
 
 > 🚫 **禁止篡改 baseline（违者严肃处理）**：官方 baseline `147s` 是全体统一基准，**不得修改** `perf_test.py` 里的
