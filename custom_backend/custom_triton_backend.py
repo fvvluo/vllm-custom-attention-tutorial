@@ -43,18 +43,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from .triton_attention import paged_attention_triton
 
-# Select the attention implementation used by CustomTritonImpl.forward.
-#   WZC_SPARSE_BACKEND=1  -> wzc block-level top-k sparse prefill kernel adapter
-#                            (falls back to torch for decode / ragged requests);
-#   otherwise             -> the tutorial's simple Triton kernel (default).
-# Both satisfy the same paged_attention_* signature (README Part 3).
-import os as _os
-
-if _os.environ.get("WZC_SPARSE_BACKEND") == "1":
-    from .wzc_sparse_attention import paged_attention_wzc as _paged_attention_fn
-else:
-    _paged_attention_fn = paged_attention_triton
-
 
 # ============================================================================
 # 1. 本后端使用的 attention 元数据
@@ -146,21 +134,6 @@ class CustomTritonBackend(AttentionBackend):
     def get_supported_head_sizes(cls) -> list[int]:
         # Qwen3-32B head_dim=128；示例 kernel 对 head_size 是 2 的幂时最稳。
         return [32, 64, 128, 256]
-
-    @staticmethod
-    def get_supported_kernel_block_sizes():
-        # WZC 稀疏后端下，让 vLLM 用 block_size=128 分配分页 KV cache，使物理页布局
-        # 直接等于 wzc paged-decode kernel 的 128-page pool -> decode 走
-        # `_decode_one_zerocopy` 零拷贝路径（不再每步 gather+repack 整段历史）。
-        # vLLM 默认 block_size=16 会让 decode 落到慢路径：100k context 下每 token
-        # 复制 ~95k 历史 -> 实测 TPOT 260ms。声明 128 后 get_preferred_block_size
-        # 返回 128（默认 16 不被 128 整除，取 min=128）。
-        # 仅在 wzc 后端启用；教学默认路径（simple Triton kernel，按 stride 寻址、
-        # 与 block_size 无关）返回空表示不约束，保持原行为。
-        from vllm.v1.attention.backend import MultipleOf
-        if _os.environ.get("WZC_SPARSE_BACKEND") == "1":
-            return [128]
-        return [MultipleOf(1)]
 
     @staticmethod
     def get_kv_cache_shape(
@@ -266,7 +239,7 @@ class CustomTritonImpl(AttentionImpl):
         # 的写入位置一致。
         # output 传成 [num_tokens, num_heads, head_size] 视图供原地写入。
         out_view = output[:num_actual_tokens].view(-1, self.num_heads, hs)
-        _paged_attention_fn(
+        paged_attention_triton(
             query=query[:num_actual_tokens],
             key_cache=key_cache,
             value_cache=value_cache,
