@@ -609,8 +609,12 @@ TPOT            : 35.57 ms/token   <- decode 每 token 耗时 (=1/吞吐)
 decode 吞吐     : 28.1 tokens/s   <- 首 token 之后的生成速度
 端到端总时延    : 112.269 s   <- 本次实际请求 (~24 tok) 的总耗时
 E2E 评分        : 146.981 s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到端时间，越低越好)
+----------------------------------------------------------------
+官方 baseline   : 147.0 s   <- flash_attn 单张 H20 实测，评分基准
+本次所用 baseline: 147.0 s   （= 官方值，未改动）
+加速比          : 1.00x   <- baseline 147.0s / 本次 147.0s (比 baseline 快)
 ================================================================
-[perf] SUMMARY input=95653 out=24 ttft_s=111.411 tpot_ms=35.57 decode_tps=28.1 total_s=112.269 e2e_score_s=146.981
+[perf] SUMMARY input=95653 out=24 ttft_s=111.411 tpot_ms=35.57 decode_tps=28.1 total_s=112.269 e2e_score_s=146.981 baseline_e2e_s=147.0 speedup=1.00x
 ```
 
 > **为什么是 ~95653 而不是 100000？** `--input-len 100000` 是**目标**长度；脚本用 Qwen3 tokenizer
@@ -638,24 +642,33 @@ E2E 评分        : 146.981 s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到�
 python scripts/perf_test.py --port 8004 --input-len 100000 --output-len 64
 ```
 
-脚本会输出三个你关心的数（下面是 flash_attn baseline 的值）：
+脚本会**自动输出** E2E 分数**和加速比**（下面是 flash_attn baseline 自己的值，所以加速比是 1.00x）：
 
 ```
 TTFT (中位数)   : 111.411 s
 TPOT            : 35.57 ms/token
 E2E 评分        : 146.981 s   <- TTFT + 1000×TPOT
+----------------------------------------------------------------
+官方 baseline   : 147.0 s   <- flash_attn 单张 H20 实测，评分基准
+本次所用 baseline: 147.0 s   （= 官方值，未改动）
+加速比          : 1.00x   <- baseline 147.0s / 本次 146.981s
 ```
 
-**评分口径统一为 `E2E = TTFT + 1000 × TPOT`**，即"生成 1000 个 token 的端到端时间"，**数值越低越好**。它同时惩罚 prefill 慢（TTFT 高）和 decode 慢（TPOT 高），所以一个数就能公平比较不同 kernel。手算也行：
+**评分口径统一为 `E2E = TTFT + 1000 × TPOT`**（越低越好）、**加速比 = `官方 baseline 147s / 你的 E2E`**（>1 即比 baseline 快，脚本已自动算好，不用手算）。E2E 同时惩罚 prefill 慢（TTFT 高）和 decode 慢（TPOT 高），一个数就能公平比较不同 kernel。想核对可手算：
 
 ```
 TPOT(s)   = 1 / decode_tps                # 例：1 / 28.1 ≈ 0.03557 s = 35.57 ms
 E2E(s)    = TTFT + 1000 × TPOT            # 例：111.411 + 1000 × 0.03557 ≈ 146.98 s
+加速比     = 147 / E2E                     # 例：147 / 146.98 ≈ 1.00x
 ```
+
+> 🚫 **禁止篡改 baseline（违者严肃处理）**：官方 baseline `147s` 是全体统一基准，**不得修改** `perf_test.py` 里的
+> `OFFICIAL_BASELINE_E2E`，也不得用 `--baseline-e2e` 传非官方值来虚高加速比。一旦传了非官方值，脚本会自动
+> 在输出里打上 `⚠️ 已被覆盖 / [BASELINE_TAMPERED]` 标记，成绩视为无效。
 
 > **成绩可比的前提（重要）**：必须用**默认参数**跑 —— `--input-len 100000`（实际 ~95653 token，人人一致）、
 > `--output-len 64`、不加 `--allow-prefix-cache`。改了输入长度或开了前缀缓存，分数就**不可与 baseline 或他人比较**。
-> 提交成绩时请连同脚本最后一行 `[perf] SUMMARY ...`（含 `input= / ttft_s / tpot_ms / decode_tps / e2e_score_s`）
+> 提交成绩时请连同脚本最后一行 `[perf] SUMMARY ...`（含 `e2e_score_s / baseline_e2e_s / speedup`）
 > 与 **GPU 型号**一起给出；不同卡型之间也不可直接比（baseline 是单张 H20）。
 
 ### 4.3 CUSTOM 后端：只在小长度上对比（朴素 kernel 跑不动 100k）

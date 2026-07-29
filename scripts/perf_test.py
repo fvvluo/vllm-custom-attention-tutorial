@@ -3,6 +3,17 @@
 perf_test.py —— vLLM OpenAI 兼容服务的长上下文性能测试。
 =============================================================================
 
+⚠️⚠️⚠️  评分公约（务必阅读，违者严肃处理）  ⚠️⚠️⚠️
+  1. 官方 baseline E2E = 147.0s（flash_attn 单张 H20 实测），是所有人共同的评分基准，
+     **严禁修改**：不得改动本文件中的 OFFICIAL_BASELINE_E2E 常量，也不得用
+     `--baseline-e2e` 传入非官方值来虚高加速比。
+  2. 一旦传了非官方 baseline，脚本会自动在输出中打上 “⚠️ 已被覆盖 / BASELINE_TAMPERED”
+     标记，成绩视为无效。
+  3. 评分必须用默认参数（--input-len 100000 --output-len 64，不加 --allow-prefix-cache），
+     并且先通过 Part 3 正确性测试（提交 correctness.png）后，性能分数才有效。
+  篡改 baseline、正确性未过却提交性能分等行为，均视为作弊，将被严肃处理。
+=============================================================================
+
 它测什么：
   给服务发一条**指定长度**的输入（默认 100k token，贴近 Qwen3 的 128k 上下文上限），
   用流式(stream=True)接口测两个关键指标：
@@ -12,6 +23,7 @@ perf_test.py —— vLLM OpenAI 兼容服务的长上下文性能测试。
     - TPOT (Time Per Output Token)：decode 每个 token 的耗时，= 1 / decode 吞吐；
     - E2E 评分 = TTFT + 1000 × TPOT：把 prefill 与 decode 汇总成"生成 1000 token
       的端到端秒数"作为可比较的分数（越低越好）——这就是给不同 kernel 打分用的数字。
+    - 加速比 = 官方 baseline(147s) / 本次 E2E（>1 表示比 baseline 快）。
   另外给出端到端总时延、实际生成 token 数。
 
 为什么用 100k 输入：
@@ -147,6 +159,9 @@ def main() -> int:
     ap.add_argument("--allow-prefix-cache", action="store_true",
                     help="默认每次请求加唯一前缀以绕过 prefix caching（测真实 prefill）；"
                          "加本开关则不加唯一前缀，故意测命中缓存后的 TTFT")
+    ap.add_argument("--baseline-e2e", type=float, default=147.0,
+                    help="[请勿修改] flash_attn 官方 baseline E2E 分数(秒)，用于自动算加速比。"
+                         "默认 147（单张 H20 实测，全体统一基准）。传入非官方值会被标记为作弊、成绩无效")
     args = ap.parse_args()
 
     import uuid
@@ -207,6 +222,15 @@ def main() -> int:
     # 这样把 prefill(TTFT) 与 decode(TPOT) 用一个可比较的秒数汇总，方便给不同 kernel 打分。
     e2e_score_s = med_ttft + 1000.0 * tpot_s if med_tps > 0 else float("nan")
 
+    # 加速比：baseline E2E / 本次 E2E（>1 表示比 baseline 快）。
+    # ========================================================================
+    # ⚠️ 严禁修改下面这个常量！这是全体统一的官方评分基准（flash_attn 单张 H20 实测）。
+    #    篡改 baseline 以虚高加速比属于作弊，将被严肃处理。
+    # ========================================================================
+    OFFICIAL_BASELINE_E2E = 147.0  # flash_attn 单张 H20 官方 baseline，禁止改动
+    speedup = (args.baseline_e2e / e2e_score_s) if (args.baseline_e2e > 0 and e2e_score_s > 0) else None
+    baseline_tampered = abs(args.baseline_e2e - OFFICIAL_BASELINE_E2E) > 1e-6
+
     print("=" * 64)
     print(f"输入长度        : ~{actual_len} tokens ({tag})")
     print(f"生成长度        : {med_out} tokens (上限 {args.output_len})")
@@ -215,11 +239,24 @@ def main() -> int:
     print(f"decode 吞吐     : {med_tps:.1f} tokens/s   <- 首 token 之后的生成速度")
     print(f"端到端总时延    : {med_total:.3f} s   <- 本次实际请求 (~{med_out} tok) 的总耗时")
     print(f"E2E 评分        : {e2e_score_s:.3f} s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到端时间，越低越好)")
+    # 单独、显式地打印本次使用的 baseline，便于核对成绩是否公平（防止偷改 baseline 刷加速比）
+    print("-" * 64)
+    print(f"官方 baseline   : {OFFICIAL_BASELINE_E2E:.1f} s   <- flash_attn 单张 H20 实测，评分基准")
+    print(f"本次所用 baseline: {args.baseline_e2e:.1f} s"
+          + ("   ⚠️ 已被 --baseline-e2e 覆盖，非官方值，加速比无效！" if baseline_tampered
+             else "   （= 官方值，未改动）"))
+    if speedup is not None:
+        print(f"加速比          : {speedup:.2f}x   <- baseline {args.baseline_e2e:.1f}s / 本次 {e2e_score_s:.1f}s "
+              f"({'比 baseline 快' if speedup >= 1 else '比 baseline 慢'})"
+              + ("  [基于非官方 baseline，无效]" if baseline_tampered else ""))
     print("=" * 64)
     # 一行机器可读汇总，便于把两个后端结果对比
+    speedup_str = f" speedup={speedup:.2f}x" if speedup is not None else ""
     print(f"[perf] SUMMARY input={actual_len} out={med_out} "
           f"ttft_s={med_ttft:.3f} tpot_ms={tpot_s * 1000:.2f} decode_tps={med_tps:.1f} "
-          f"total_s={med_total:.3f} e2e_score_s={e2e_score_s:.3f}")
+          f"total_s={med_total:.3f} e2e_score_s={e2e_score_s:.3f} "
+          f"baseline_e2e_s={args.baseline_e2e:.1f}{speedup_str}"
+          + ("  [BASELINE_TAMPERED]" if baseline_tampered else ""))
     return 0
 
 
