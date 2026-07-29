@@ -75,6 +75,13 @@ def _load_kernel():
     return k
 
 
+def _load_kernel_rect():
+    """Import the RECTANGULAR-causal sparse-prefill kernel (chunked prefill:
+    q_len < kv_len, context-offset causal). See ops/_wzc_attn_sparse_rect.py."""
+    from ops import _wzc_attn_sparse_rect as k
+    return k
+
+
 def _load_paged_decoder():
     """Import the wzc paged decode kernel (FlashDecoding split-KV, page_size=128)."""
     from ops import _wzc_paged_attn_decode as d
@@ -82,6 +89,7 @@ def _load_paged_decoder():
 
 
 _KERNEL = None
+_KERNEL_RECT = None
 _DECODER = None
 _PAGE = 128          # the paged decode kernel's fixed page_size == BLOCK_N
 _DECODE_GROUP = 8    # kernel requires q_heads == kv_heads * 8 (GQA group)
@@ -294,6 +302,16 @@ def paged_attention_wzc(
         decode_ok = (use_sparse and q_len == 1 and seq_len > 1
                      and num_heads == K.shape[1] * _DECODE_GROUP)
 
+        # CHUNKED prefill (q_len>1, has context): q_len query tokens at absolute
+        # positions [context, context+q_len), context = seq_len - q_len. This is
+        # the bulk of long-context prefill under vLLM's default chunked scheduling
+        # -> route to the RECTANGULAR-causal sparse kernel (not the slow torch
+        # fallback). The kernel needs context % 128 == 0 (vLLM chunk boundaries
+        # satisfy this when max_num_batched_tokens is a 128-multiple, e.g. 2048).
+        context = seq_len - q_len
+        chunk_ok = (use_sparse and q_len > 1 and context > 0
+                    and context % _BLOCK == 0)
+
         if kernel_ok:
             s_pad = ((seq_len + _BLOCK - 1) // _BLOCK) * _BLOCK
             pad = s_pad - seq_len
@@ -308,6 +326,35 @@ def paged_attention_wzc(
             Ok = _KERNEL.run(Qk, Kk, Vk, causal=True, sm_scale=scale,
                              tau=tau, local_window=_LOCAL, sink_blocks=_SINK)
             # (1,H,S,D) -> (q_len,H,D), dropping padded rows.
+            output[q0:q1] = Ok[0, :, :q_len].transpose(0, 1).to(output.dtype)
+            _stat["kernel_reqs"] += 1
+            _stat["kernel_tokens"] += q_len
+            if seq_len > _stat["max_kernel_seq"]:
+                _stat["max_kernel_seq"] = seq_len
+        elif chunk_ok:
+            # Rectangular causal: pad q_len up to 128; kv_pad = context + q_pad
+            # (>= real seq_len, and 128-aligned since context is). Zero-pad K/V at
+            # the END: padded key rows sit at absolute positions >= seq_len, and a
+            # real query row (< seq_len) only attends keys <= its abs pos, so it
+            # never sees padding; padded query rows produce discardable output
+            # (we read back only the first q_len rows).
+            global _KERNEL_RECT
+            if _KERNEL_RECT is None:
+                _KERNEL_RECT = _load_kernel_rect()
+            q_pad = ((q_len + _BLOCK - 1) // _BLOCK) * _BLOCK
+            kv_pad = context + q_pad                       # 128-aligned
+            padq = q_pad - q_len
+            padkv = kv_pad - seq_len
+            Qk = q.transpose(0, 1).unsqueeze(0).contiguous()       # (1,H,q_len,D)
+            Kk = K.transpose(0, 1).unsqueeze(0).contiguous()       # (1,HK,seq,D)
+            Vk = V.transpose(0, 1).unsqueeze(0).contiguous()
+            if padq:
+                Qk = torch.nn.functional.pad(Qk, (0, 0, 0, padq))
+            if padkv:
+                Kk = torch.nn.functional.pad(Kk, (0, 0, 0, padkv))
+                Vk = torch.nn.functional.pad(Vk, (0, 0, 0, padkv))
+            Ok = _KERNEL_RECT.run(Qk, Kk, Vk, causal=True, sm_scale=scale,
+                                  tau=tau, local_window=_LOCAL, sink_blocks=_SINK)
             output[q0:q1] = Ok[0, :, :q_len].transpose(0, 1).to(output.dtype)
             _stat["kernel_reqs"] += 1
             _stat["kernel_tokens"] += q_len
