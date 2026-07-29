@@ -246,3 +246,30 @@ reroute only the READ to V3 when supported). Feature flag
 - Real service smoke (baseline + V4), service-level prefill fallback + decode hit,
   TTFT/TPOT/E2E, HumanEval. These remain pending; do NOT read the synthetic PASS as a
   service PASS.
+
+### D (V4-R). Real backend-forward gate — PASS; one BF16 service attempt — RESOURCE_CONTENDED
+- **Real CustomTritonImpl.forward gate — PASS** (`logs/v4_backend_forward_gpu5.log`,
+  physical GPU 5 UUID 6afcc978, EXIT_CODE=0, `BACKEND_FORWARD_GATE=PASS`, 24/24). Drives
+  the actual forward (real metadata + real KV-cache WRITE via reshape_and_cache + real
+  read dispatch); only fixture is a tiny `_Layer` exposing `_k_scale`/`_v_scale`=1.0.
+  - [A] flag=0 → Triton read path, vs ref 2.17e-4, V3 hits=0.
+  - [B] flag=1 → forward HITS V3 (hit +1 each of ns1_sl128 / ns1_sl8192 / ns4_mixed);
+    forward(V3) == direct V3 **bit-identical** (max_abs 0); vs ref ≤5e-3; output
+    `[num_tokens,num_heads,head_size]` bf16 contract OK.
+  - [C] prefill (max_query_len>1) → Triton fallback (V3 hits unchanged, reason
+    `not_pure_decode`), vs causal ref within tutorial 2e-2 (7.76e-3; strict-5e-3 is too
+    tight for the bf16 Triton path — fixture tolerance, not a code fault).
+  - [D] fp16 decode → fallback (reason `query_dtype=torch.float16`), correct.
+  - [E] A→B→A through real forward: A1==A2, A≠B (no first-tensor capture).
+  - Totals: v3_hits=6, fallbacks=2.
+- **BF16 service smoke — RESOURCE_CONTENDED (NOT a code failure):** one allowed attempt,
+  baseline flag=0 on physical GPU 6 (UUID eda292b3), GPU_MEM_UTIL=0.78, MAX_LEN=8192,
+  port 8403. Passed the startup free-mem check and loaded to "Using
+  AttentionBackendEnum.CUSTOM backend", then `torch.OutOfMemoryError` mid weight-load:
+  two foreign processes (32.8 GiB + 62.1 GiB) co-landed on GPU 6 during the ~20s load
+  (`logs/v4_serve_baseline_gpu6_8403.log`). Per discipline: no 2nd BF16 attempt, no
+  card-swap, no FP8 (no repo FP8 evidence — grep empty). Service-level V3-hit /
+  prefill-fallback / TTFT/TPOT/E2E remain PENDING on a durably-free ≥75 GiB GPU.
+- Min-viable BF16 (from prior successful serve log): weights+non-torch ≈ 61.9 GiB,
+  peak activation ≈ 1.48 GiB; needs startup free ≈ util×95 GiB. util 0.78 ⇒ ~74 GiB
+  free needed, leaving ~10 GiB KV (~40k tokens) — ample for an 8192-len smoke.
