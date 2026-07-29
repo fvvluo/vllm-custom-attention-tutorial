@@ -148,6 +148,21 @@ class CustomTritonBackend(AttentionBackend):
         return [32, 64, 128, 256]
 
     @staticmethod
+    def get_supported_kernel_block_sizes():
+        # WZC 稀疏后端下，让 vLLM 用 block_size=128 分配分页 KV cache，使物理页布局
+        # 直接等于 wzc paged-decode kernel 的 128-page pool -> decode 走
+        # `_decode_one_zerocopy` 零拷贝路径（不再每步 gather+repack 整段历史）。
+        # vLLM 默认 block_size=16 会让 decode 落到慢路径：100k context 下每 token
+        # 复制 ~95k 历史 -> 实测 TPOT 260ms。声明 128 后 get_preferred_block_size
+        # 返回 128（默认 16 不被 128 整除，取 min=128）。
+        # 仅在 wzc 后端启用；教学默认路径（simple Triton kernel，按 stride 寻址、
+        # 与 block_size 无关）返回空表示不约束，保持原行为。
+        from vllm.v1.attention.backend import MultipleOf
+        if _os.environ.get("WZC_SPARSE_BACKEND") == "1":
+            return [128]
+        return [MultipleOf(1)]
+
+    @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
         block_size: int,
