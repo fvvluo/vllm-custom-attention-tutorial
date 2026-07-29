@@ -190,26 +190,39 @@ def _decode_one_zerocopy(q1, key_cache, value_cache, block_table, req, seq_len, 
 
 def _torch_causal_gqa(q, k, v, scale):
     """Exact fallback for one request. q:(q_len,H,D) k/v:(seq_len,HK,D) fp.
-    causal with context: query i (0-based within query) attends [0, context+i]."""
+    causal with context: query i (0-based within query) attends [0, context+i].
+
+    Memory-safe: chunked over q-rows so we never materialize the full
+    (q_len, group, seq_len) score tensor. At 100k chunked prefill a chunk can be
+    q_len~2048 attending seq_len~95k; the naive einsum tried to alloc (2048,8,95k)
+    fp32 ~= several GiB PER kv-head and OOM'd the engine (only ~512MiB free after
+    weights+KV). Processing Q_CHUNK rows at a time caps peak at (Q_CHUNK,group,seq).
+    """
     q_len, num_heads, hd = q.shape
     seq_len, num_kv_heads, _ = k.shape
     context = seq_len - q_len
     group = num_heads // num_kv_heads
-    qf = q.float() * scale
     kf = k.float()
     vf = v.float()
     out = torch.empty((q_len, num_heads, hd), dtype=torch.float32, device=q.device)
-    # per kv-head block of q-heads, batched over q rows with a causal mask
-    row = torch.arange(q_len, device=q.device)[:, None]          # (q_len,1)
     col = torch.arange(seq_len, device=q.device)[None, :]        # (1,seq_len)
-    mask = col > (context + row)                                 # True = disallow
-    for kvh in range(num_kv_heads):
-        qh = qf[:, kvh * group:(kvh + 1) * group, :]             # (q_len,group,D)
-        scores = torch.einsum("qgd,kd->qgk", qh, kf[:, kvh, :])  # (q_len,group,seq)
-        scores = scores.masked_fill(mask[:, None, :], float("-inf"))
-        w = torch.softmax(scores, dim=-1)
-        out[:, kvh * group:(kvh + 1) * group, :] = torch.einsum(
-            "qgk,kd->qgd", w, vf[:, kvh, :])
+    # Row-chunk size: keep peak scores tensor small regardless of q_len/seq_len.
+    # Peak ~= Q_CHUNK*group*seq_len*4 bytes; at seq_len~95k, group=8 that is
+    # 64*8*95k*4 ~= 195MB (fits the tight ~512MB-free budget at 100k). The engine
+    # OOM'd at Q_CHUNK==q_len(2048) which needed several GiB per kv-head.
+    Q_CHUNK = 64
+    for r0 in range(0, q_len, Q_CHUNK):
+        r1 = min(r0 + Q_CHUNK, q_len)
+        qf = q[r0:r1].float() * scale                            # (rc,H,D)
+        row = torch.arange(r0, r1, device=q.device)[:, None]     # (rc,1)
+        mask = col > (context + row)                             # (rc,seq) True=disallow
+        for kvh in range(num_kv_heads):
+            qh = qf[:, kvh * group:(kvh + 1) * group, :]         # (rc,group,D)
+            scores = torch.einsum("qgd,kd->qgk", qh, kf[:, kvh, :])  # (rc,group,seq)
+            scores = scores.masked_fill(mask[:, None, :], float("-inf"))
+            w = torch.softmax(scores, dim=-1)
+            out[r0:r1, kvh * group:(kvh + 1) * group, :] = torch.einsum(
+                "qgk,kd->qgd", w, vf[:, kvh, :])
     return out.to(q.dtype)
 
 

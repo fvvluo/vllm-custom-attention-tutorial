@@ -373,14 +373,34 @@ E2E = TTFT(76%) + 1000×TPOT(24%)。正确性测试 `ALL PASS` 是所有方案�
 
 ### 阶段 B —— 砍 TTFT，超越 flash（对应 D3-b / D1-c，有损但守闸门）
 - **入口**：阶段 A gate 通过（有了有效 E2E）。
-- **动作**：
-  1. 用阶段 0 已触发的 `_wzc_attn_sparse.py`，在 tau∈{1.0, 0.999, 0.99, 0.95} 扫。
-  2. 完整 HumanEval `pass@1` 自测（vs flash 145/164），画 **pass@1 vs E2E 帕累托**，定生产 tau。
-  3.（可选，D2-b）若确认稀疏有效，投 kernel 化的 context 矩形 causal，去掉 `--no-enable-chunked-prefill`
-     的配置依赖，做生产正道。
+
+**B.0 关键实测发现（2026-07-29，重塑本阶段）**：起 100k chunked+piecewise 服务（`CHUNKED=1`
+`MAX_LEN=98304` GPU_MEM_UTIL=0.95，KV 103776 tokens，正常就绪），发 100k 请求 → **EngineCore
+CUDA OOM 崩溃**。根因：chunked prefill 的**后续 chunk**（q_len≈2048, context≈93k）走适配器
+`_torch_causal_gqa`，其 `scores = einsum("qgd,kd->qgk")`（`wzc_sparse_attention.py:208`）物化
+`(2048, 8, ~95k)` fp32 ≈ 每 kv-head 数 GiB，权重+KV 占满 95GB 后只剩 ~512MiB → 试图分配 4GiB 即 OOM。
+- **含义（load-bearing）**：**torch 回退在 100k 上根本跑不起来**——所以矩形 causal 稀疏 kernel
+  不只是「加速」，而是**让 100k 能跑通的前提**。同时也要先把回退改成**显存安全**（分块 einsum），
+  否则任何未被 kernel 覆盖的 chunk 都会 OOM。
+- 已验证：矩形 causal 稀疏**算法**（`ops/_wzc_sparse_rect_ref.py` torch 参考）tau=1==dense
+  逐位一致（max_err ~1e-7，ctx=0/2048/4096），算法正确性已锁定，可作未来 kernel 的金标准。
+
+- **动作（按依赖排序）**：
+  1. **B.0 修回退显存安全**（先做，小改动）：`_torch_causal_gqa` 的 einsum 分块（over q-rows 或
+     kv-cols）避免物化 `(q_len, group, seq)`，让 100k chunked 至少**能正确跑通**（慢但不崩）→ 建立
+     诚实的 E2E 基线上界。
+  2. **B.1 矩形 causal 稀疏 kernel**（核心，D2-b）：把 `_wzc_attn_sparse.py` 的 square-causal 扩展为
+     **context 偏移矩形 causal**（新文件，不改现有 kernel）：query 块行绝对位置 `context+row_base+i`，
+     `n_block_max=ceil((abs_row_last+1)/128)`，段选择在完整 `[0,seq_len)` context 上做，对角/边界段
+     用绝对位置 causal mask。参考 `_wzc_sparse_rect_ref.py` 的 index 公式对拍。适配器把带 context 的
+     chunk 路由到它（替换 torch 回退）。
+  3. 用它 + 阶段 0 已验证的 chunk0 pure-prefill 稀疏，在 tau∈{1.0, 0.999, 0.99, 0.95} 扫。
+  4. 完整 HumanEval `pass@1` 自测（vs flash 145/164），画 **pass@1 vs E2E 帕累托**，定生产 tau。
 - **验收 gate**：
   - **tau=1 仍过 `test_paged_attn_correctness.py`（`ALL PASS`）**——有损方案的正确性底线。
-  - 选定 tau 下 HumanEval 掉 ≤1~2 题；`perf_test` E2E **低于 147s**（加速比 > 1）。
+    （该测试含 decode/mixed，矩形 causal kernel 接入后要保持全绿。）
+  - 100k chunked 服务**不再 OOM、能跑完**；选定 tau 下 HumanEval 掉 ≤1~2 题；
+    `perf_test` E2E（默认参数 100k）**低于 147s**（加速比 > 1）。
 
 ### 阶段 C —— fp8 KV（对应 D3-c，可选收尾，压 TPOT/中长 prefill）
 - **入口**：阶段 A（+B）稳定；有余力再做。

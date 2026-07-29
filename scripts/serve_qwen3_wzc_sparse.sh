@@ -78,15 +78,32 @@ fi
 # 允许外部追加任意 serve 参数（如 --no-async-scheduling）。
 read -r -a _EXTRA_SERVE <<< "${EXTRA_SERVE_ARGS:-}"
 
+# ---- chunked prefill 开关（阶段 B 用）----
+# CHUNKED=0（默认）：--no-enable-chunked-prefill —— 整段 prompt 一次 pure-prefill 触发
+#   square 稀疏 kernel。单卡 H20 上限 ~32k（超了激活+KV 抢显存 OOM，见设计文档 §5 轨-0）。
+# CHUNKED=1：用 vLLM 默认 chunked prefill —— 100k prompt 切成 chunk（激活受限，显存够）。
+#   chunk0 是 pure-prefill（q_len==seq_len，走稀疏 kernel）；后续 chunk 有 context
+#   （q_len<seq_len），当前适配器走精确 torch 回退（正确但慢）——这是阶段 B 要用矩形
+#   causal 稀疏 kernel 替换的部分。用它建立“chunked ON 正确性/性能基线”。
+CHUNKED="${CHUNKED:-0}"
+CHUNK_ARGS=()
+if [[ "${CHUNKED}" == "1" ]]; then
+    : # 不加 --no-enable-chunked-prefill，用 vLLM 默认（开启）。可选调 chunk 大小：
+    [[ -n "${MAX_NUM_BATCHED_TOKENS_OVERRIDE:-}" ]] && \
+        CHUNK_ARGS+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS_OVERRIDE}")
+else
+    CHUNK_ARGS+=(--no-enable-chunked-prefill \
+                 --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
+fi
+
 exec python -m vllm.entrypoints.openai.api_server \
     --model "${MODEL}" \
     --served-model-name "${SERVED_NAME}" \
     --port "${PORT}" \
     --gpu-memory-utilization "${GPU_MEM_UTIL}" \
     --max-model-len "${MAX_LEN}" \
-    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
-    --no-enable-chunked-prefill \
     --attention-backend CUSTOM \
+    "${CHUNK_ARGS[@]}" \
     "${EAGER_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
     "${_EXTRA_SERVE[@]}"
