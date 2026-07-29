@@ -9,7 +9,19 @@
 >
 > 状态：**设计稿，未改任何代码**。等你在 §7 做决策后再进入实现。
 >
-> 更新（对齐 origin 最新 README）：评分口径已从「TTFT + decode 吞吐两个数」统一为**单一分数
+> 更新（对齐 origin 最新 README，2026-07-29）：**接入方式已重构为契约合规**。origin 的
+> Part 2.5 明确铁律——只改 `custom_backend/triton_attention.py::paged_attention_triton`
+> 函数体，不动 `custom_triton_backend.py`/`plugin.py`/`__init__.py`/`pyproject.toml`。原方案用
+> 了 `custom_triton_backend.py` 的环境开关 + `get_supported_kernel_block_sizes`，已全部撤销：
+> wzc 逻辑改由 `triton_attention.py` 委托 `wzc_sparse_attention.py`（新文件，非受保护文件），
+> 4 个受保护文件**逐字节还原到 origin**；block_size=128 改用 serve 脚本的 `--block-size 128`
+> CLI（查证 vLLM 源码：用户显式 `--block-size` 优先于 backend 的 `get_preferred_block_size`）。
+> **关键收益**：`test_paged_attn_correctness.py` 直接 import `paged_attention_triton`，重构后
+> 它测的就是 wzc kernel（实测 ALL PASS：prefill 8.7e-3 / decode 3.9e-3 / mixed 1.07e-2），
+> 即 `correctness.png` 现在真正为 wzc kernel 背书。vLLM 源码路径也从硬编码改为 `../vllm_src`
+> 兄弟目录（旧路径本机仍在，作回退）。
+
+> 更早更新：评分口径已从「TTFT + decode 吞吐两个数」统一为**单一分数
 > `E2E = TTFT + 1000×TPOT`**（baseline **147s**，越低越好，加速比 = 147 / 你的 E2E），并把
 > **正确性测试 `ALL PASS`** 定为性能分生效的**硬前提**（提交 `correctness.png` + `performance.png`
 > 两张截图）。这重排了优化优先级——见 §0.5 与 §1.1。
