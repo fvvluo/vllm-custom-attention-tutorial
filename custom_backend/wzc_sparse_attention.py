@@ -56,7 +56,7 @@ if _ATTN_TEST_DIR not in sys.path:
 #                the pad-to-128 pure-prefill path costs ~nothing extra).
 #   - tau<1.0  -> lossy block-top-k sparsity; lower tau = more skipped KV segments
 #                = faster long-context prefill, at some quality risk.
-_TAU = float(os.environ.get("WZC_SPARSE_TAU", "0.999"))
+_TAU = 0.9
 _LOCAL = 2
 _SINK = 1
 _FORCE_DENSE = False  # debug toggle: True -> always torch fallback
