@@ -8,6 +8,14 @@
 
 > 面向对象：拿到同款镜像的同学，照着本 README 从零复现。所有命令都是自包含的（绝对路径 + 环境变量 + 预期输出）。
 
+> ## 🚧 改动规则（硬性要求，务必遵守）
+>
+> - **唯一可修改的现有文件**：`custom_backend/triton_attention.py`。仓库里**其它已有文件一律不得修改**（包括 `custom_backend/custom_triton_backend.py`、`plugin.py`、`__init__.py`、`pyproject.toml`、`scripts/`、`tests/` 等）。
+> - **允许新增文件**：你可以往仓库里**加**任意新文件（例如把你的 kernel 放在 `custom_backend/my_kernel.py`，或引入外部库/编译好的 CUDA 扩展）。
+> - **唯一接入方式**：所有新增的实现都必须在 `triton_attention.py` 里通过 `import` 引入并调用（在 `paged_attention_triton(...)` 内完成计算并写回 `output`）。函数名与参数列表**不可改**。
+>
+> 一句话：**只改 `triton_attention.py`；别的现有文件只读；新代码放新文件里，再在 `triton_attention.py` 内 import 调用。**
+
 > **📊 评分怎么算（先看这个）**：接入你自己的 attention kernel 后，用**统一分数** `E2E = TTFT + 1000 × TPOT`（生成 1000 token 的端到端秒数，**越低越好**）来衡量。本教程 flash_attn 的 **baseline = `147s`**（单张 H20，~95k 输入实测），你的**加速比 = `147s / 你的 E2E 用时`**。起好服务后跑一条 `scripts/perf_test.py` 即可直接读出分数，详见 [**Part 4.2「评测你自己 kernel 的 E2E 分数」**](#42-评测你自己-kernel-的-e2e-分数)。
 
 > **📮 最终需要提交两项（每项都要「命令 + 该命令的输出截图」，缺一不可）**：
