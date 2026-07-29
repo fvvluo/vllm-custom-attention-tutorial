@@ -346,18 +346,30 @@ E2E = TTFT(76%) + 1000×TPOT(24%)。正确性测试 `ALL PASS` 是所有方案�
   - ⚠️ **`MAX_LEN=102400` 启动即 OOM**（关分块→单 forward 激活+KV 抢显存，KV 仅 8.82GiB<25GiB 需求）。
     → **100k 评分必须走阶段 0.2-B（kernel 支持 chunked/context prefill），不能靠配置法**。见 §5 轨-0 更新。
 
-### 阶段 A —— 拉正 TPOT，拿有效 E2E（对应 D4「入场券」，工程重但必做）
-- **入口**：阶段 0 gate 通过。
-- **动作**：
-  1. 让 `CustomTritonBackend` 可被 CUDA graph 捕获：提升 `_cudagraph_support`，`forward` 去除
-     运行期 `.tolist()`/python per-request 循环（graph 要求 shape/控制流稳定）。
-  2. decode 改 **batched paged decode**（一次 kernel 处理整 batch 单 token）——给现有
-     `PagedKVDecoder` 加 batched wrapper 或多请求分派。
-  3. serve 去掉 `--enforce-eager`（及 `--no-async-scheduling`）。
-- **验收 gate**：
-  - 正确性测试仍 `ALL PASS`（无损，不碰精度）。
-  - `perf_test.py` 完整 **E2E**：TPOT 拉回 baseline 量级（~35ms，≠ eager 的 ~102ms）；
-    与 flash 147s 建立**真实差距基线**。这是第一份可提交的 `performance.png`。
+### 阶段 A —— 拉正 TPOT，拿有效 E2E（对应 D4「入场券」）
+分两步：**A1（PIECEWISE，配置级，已完成）** + **A2（FULL，需 batched kernel，按需）**。
+
+**A1 —— PIECEWISE cudagraph（✅ 已完成并验证，2026-07-29）**
+- **动作**：`serve_qwen3_wzc_sparse.sh` 加 `PIECEWISE=1`（默认）→ 去掉 `--enforce-eager`，
+  传 `-cc '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}'`。后端 `_cudagraph_support`
+  保持 NEVER 不动，**零 kernel 改动**。模型除 attention 外的部分 graph 化，attention 段间跑 eager。
+- **验收 gate（实测，GPU 3，~2k 输入）**：
+  - 服务日志确认 `cudagraph_mode=PIECEWISE`、`enforce_eager=False`、"Capturing CUDA graphs
+    (PIECEWISE): 51" 全部捕获、`unified_attention_with_output` 在 splitting_ops 里。✅
+  - **decode 23.4 tok/s（TPOT 42.8ms）vs eager 基线 9.8 tok/s（TPOT ~102ms）→ ~2.4× decode 提速、
+    TPOT 砍掉 ~59ms**，纯配置、不碰 kernel、不碰正确性。✅ 2k E2E=43.9s。
+  - 注：README flash baseline 在 2k 上是 44 tok/s（TPOT ~23ms）。A1 后 CUSTOM 的 TPOT(42.8ms) 仍
+    比 flash 高 ~20ms —— 差距来自 attention 段间仍 eager + wzc 逐请求 python 循环开销，这是 A2 的空间。
+
+**A2 —— FULL cudagraph（可选，追极致 TPOT；未做）**
+- 只有 FULL 能把 attention 也 graph 化，需要：`_cudagraph_support≥UNIFORM_SINGLE_TOKEN_DECODE`、
+  builder 纯 pass-through `common_attn_metadata`（禁 `.tolist()`/`searchsorted`/host sync）、
+  forward 单次 grid kernel 驱动整 batch（禁 per-request python 循环）。
+- 现有 `PagedKVDecoder` 是单序列接口，需写 **batched paged decode** + 仿 `TritonAttentionMetadataBuilder`
+  重写 builder。**工程量大**。**决策：先用 A1 拿有效 E2E，A2 视剩余 TPOT 差距（~20ms/token）再定**。
+- **验收 gate（A1 已满足「拿到有效 E2E」）**：
+  - 正确性测试仍 `ALL PASS`（无损，不碰精度）。✅（A1 不改 kernel，阶段 0 已过）
+  - `perf_test.py` 完整 E2E：TPOT 从 eager ~102ms 拉到 42.8ms。✅ A2 目标是进一步逼近 flash 的 ~23ms。
 
 ### 阶段 B —— 砍 TTFT，超越 flash（对应 D3-b / D1-c，有损但守闸门）
 - **入口**：阶段 A gate 通过（有了有效 E2E）。
