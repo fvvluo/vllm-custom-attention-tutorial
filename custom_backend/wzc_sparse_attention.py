@@ -50,8 +50,13 @@ _ATTN_TEST_DIR = os.environ.get(
 if _ATTN_TEST_DIR not in sys.path:
     sys.path.insert(0, _ATTN_TEST_DIR)
 
-# Sparsity hyper-parameters (fixed to the production defaults).
-_TAU = 0.999
+# Sparsity hyper-parameters. tau is read from WZC_SPARSE_TAU (default 0.999):
+#   - tau=1.0  -> LOSSLESS: selects ALL causal segments, bit-identical to dense.
+#                Use for HumanEval / correctness-sensitive runs (short prompts, so
+#                the pad-to-128 pure-prefill path costs ~nothing extra).
+#   - tau<1.0  -> lossy block-top-k sparsity; lower tau = more skipped KV segments
+#                = faster long-context prefill, at some quality risk.
+_TAU = float(os.environ.get("WZC_SPARSE_TAU", "0.999"))
 _LOCAL = 2
 _SINK = 1
 _FORCE_DENSE = False  # debug toggle: True -> always torch fallback
@@ -257,7 +262,9 @@ def paged_attention_wzc(
     use_sparse = (not _FORCE_DENSE) and head_size == 128
     if use_sparse and _KERNEL is None:
         _KERNEL = _load_kernel()
-    tau = _TAU
+    # Re-read tau per call so it can be changed at runtime (tests set
+    # WZC_SPARSE_TAU per case; a serve run sets it once in the environment).
+    tau = float(os.environ.get("WZC_SPARSE_TAU", _TAU))
 
     for req in range(num_seqs):
         q0, q1 = qsl[req], qsl[req + 1]
