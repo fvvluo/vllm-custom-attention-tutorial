@@ -13,8 +13,11 @@
 #   3) HF_OVERRIDES 支持 —— 100k 输入需 YaRN 把上下文从原生 ~40k 扩到 128k+（同
 #      serve_qwen3_flashattn.sh）。跑短上下文冒烟测试时可不设。
 #
-# 阶段说明（见 BENCHMARK_OPTIMIZATION_DESIGN.md）：本脚本是“阶段 0（解阻塞）”用的。
-#   仍保留 --enforce-eager（decode 走 eager，TPOT 项此时不看）；CUDA graph 是阶段 A 的事。
+# 阶段说明（见 BENCHMARK_OPTIMIZATION_DESIGN.md）：
+#   - 阶段 0（解阻塞）：PIECEWISE=0 → 纯 eager（--enforce-eager），只验证稀疏 kernel 触发。
+#   - 阶段 A1（压 TPOT）：PIECEWISE=1（默认）→ VLLM_COMPILE + cudagraph_mode=PIECEWISE，
+#     把 attention 之外的模型部分 graph 化（decode TPOT 主瓶颈），attention 段间仍 eager。
+#     后端 _cudagraph_support 保持 NEVER，无需改 kernel。
 #
 # 前置：
 #   1) 已跑过 scripts/setup_vllm_source.sh
@@ -53,7 +56,28 @@ if [[ -n "${HF_OVERRIDES}" ]]; then
     EXTRA_ARGS+=(--hf-overrides "${HF_OVERRIDES}")
 fi
 
-# --enforce-eager / --no-async-scheduling 的原因同教学脚本（eager 后端不参与 CUDA graph）。
+# ---- 阶段 A1：PIECEWISE CUDA graph（压 TPOT，不改 kernel）----
+# PIECEWISE=1（默认）：去掉 --enforce-eager，用 VLLM_COMPILE + cudagraph_mode=PIECEWISE。
+#   把模型除 attention 外的部分（QKV/MLP/norm/router，上百次 kernel launch）graph 化，
+#   attention 段间仍跑 eager —— 正好捕获 decode TPOT 的真正瓶颈（逐 kernel 启动开销），
+#   而 wzc 逐请求 python 循环 attention 原样保留（在 graph 之外跑）。后端 _cudagraph_support
+#   保持 NEVER：vLLM 见到 NEVER 会自动把 FULL 降级到 PIECEWISE（compilation.py 实测），
+#   这里显式写死 PIECEWISE 更稳、启动日志更清晰。
+# PIECEWISE=0：回退老的纯 eager 路径（--enforce-eager），用于 A/B 对比 TPOT。
+PIECEWISE="${PIECEWISE:-1}"
+if [[ "${PIECEWISE}" == "1" ]]; then
+    # 显式 VLLM_COMPILE + PIECEWISE；不加 --enforce-eager。
+    EXTRA_ARGS+=(-cc '{"mode":"VLLM_COMPILE","cudagraph_mode":"PIECEWISE"}')
+    # piecewise 下异步调度可保持默认开启（eager 后端才需要 --no-async-scheduling）；
+    # 若观察到请求卡住再手动加 EXTRA_SERVE_ARGS="--no-async-scheduling"。
+    EAGER_ARGS=()
+else
+    # 纯 eager 回退（阶段 0 用的路径）。
+    EAGER_ARGS=(--enforce-eager --no-async-scheduling)
+fi
+# 允许外部追加任意 serve 参数（如 --no-async-scheduling）。
+read -r -a _EXTRA_SERVE <<< "${EXTRA_SERVE_ARGS:-}"
+
 exec python -m vllm.entrypoints.openai.api_server \
     --model "${MODEL}" \
     --served-model-name "${SERVED_NAME}" \
@@ -62,7 +86,7 @@ exec python -m vllm.entrypoints.openai.api_server \
     --max-model-len "${MAX_LEN}" \
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
     --no-enable-chunked-prefill \
-    --enforce-eager \
-    --no-async-scheduling \
     --attention-backend CUSTOM \
-    "${EXTRA_ARGS[@]}"
+    "${EAGER_ARGS[@]}" \
+    "${EXTRA_ARGS[@]}" \
+    "${_EXTRA_SERVE[@]}"

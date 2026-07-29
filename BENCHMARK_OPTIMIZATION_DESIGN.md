@@ -225,25 +225,42 @@ vLLM 调度器 (enable_chunked_prefill=True, max_num_batched_tokens=2048)
 
 > 建议：先 0.2-A 打通闭环、拿到 TTFT 数字；确认稀疏有效后再投 0.2-B 做生产化。
 
-### 轨-A：无损提速——让后端可 CUDA graph 捕获（**新口径下升级为必做**，压 TPOT 项）
+### 轨-A：无损提速——CUDA graph 压 TPOT 项（**新口径下升级为必做**）
 
 **动机**：`bench_wzc_decode_adapter.py` 的方法论已经点明：教学后端 ~9.8 tok/s（TPOT≈102ms）的锅在
 `--enforce-eager`（32B 模型逐 kernel 启动，attention 只占单步极小比例）。flash 的 ~28 tok/s
 （TPOT≈35.6ms）靠 CUDA graph replay 把上百次 launch 合成一次。**在 E2E 口径下，这个 TPOT 差
 （102 vs 35.6ms）× 1000 = 直接多 66s，无论 prefill 多快都赢不了。所以 CUDA graph 是入场券。**
 
-**设计**：
-- 让 `CustomTritonBackend` 支持 CUDA graph：`_cudagraph_support` 从 `NEVER` 提升；`forward` 里
-  去掉依赖运行期 `.tolist()`/python 循环的路径（graph 捕获要求 shape/控制流稳定）。
-- decode 走 **batched paged decode**（一次 kernel 处理整个 batch 的单 token），而非 per-request
-  python 循环——现有 `PagedKVDecoder` 是单请求接口，需要一个 batched wrapper 或 persistent kernel
-  的多请求分派。
-- serve 去掉 `--enforce-eager`（及 `--no-async-scheduling`）。
+**关键调研结论（2026-07-29，源码 `vllm/config/compilation.py` + `model_executor/.../attention.py`）**：
+vLLM 有两档 cudagraph——**PIECEWISE**（把模型按 attention 边界切成段，段内 graph 化、attention 在
+段间**仍跑 eager**）和 **FULL**（含 attention 一起 graph 化）。attention 的 split 点是注册的自定义 op
+`vllm::unified_attention_with_output`（`attention.py:835` 调 `self.impl.forward`），**所有 v1 后端
+（含 CUSTOM）都走它**。因此 **PIECEWISE 不要求后端 `_cudagraph_support`≠NEVER**：
+`resolve_cudagraph_mode_and_sizes` 在后端为 NEVER 时会自动降级到 PIECEWISE（`compilation.py:1416`），
+前提是 `mode=VLLM_COMPILE` 且 splitting_ops 含 attention（默认含）。→ **拆成两步：**
 
-**风险/成本**：这是**接入层的较大改造**（graph 捕获对 metadata builder、buffer 复用有强约束）。
-但它是把 E2E 的 TPOT 项拉回 baseline 量级的**唯一正道**，无损、不碰正确性闸门。
-**若这一步不做，E2E 分数没有意义**——所以除非你只想先验证 prefill/稀疏的单点收益（轨-0 闭环），
-否则轨-A 必须排进来。
+**A1（配置级，先做，低风险，无 kernel 改动）—— PIECEWISE cudagraph**
+- 把模型其余部分（QKV proj / MLP / norm / router…上百次 launch）graph 化，attention 段间跑 eager
+  ——**正好捕获 TPOT 的真正瓶颈**，而我的逐请求 python 循环 attention 原样保留（它在 graph 之外跑）。
+- 做法：serve **去掉 `--enforce-eager`**，改设 `-O.mode=VLLM_COMPILE` + `--cudagraph-mode PIECEWISE`
+  （后端 `_cudagraph_support` 保持 NEVER 不动）。已落地为 `serve_qwen3_wzc_sparse.sh` 的
+  `PIECEWISE=1` 开关。
+- 预期：TPOT 从 ~100-160ms 降到接近 baseline（~35ms 量级），**不碰正确性、不改 kernel**。
+- 风险：piecewise 编译首次启动较慢（inductor 编译）；`--no-async-scheduling` 是否仍需要要实测
+  （原因是 eager 后端与异步调度不友好，piecewise 下可能可去掉）。
+
+**A2（可选，追求极致 TPOT）—— FULL cudagraph（需 batched graph-capturable kernel）**
+- 只有 FULL 能把 attention 也 graph 化，但要求：`_cudagraph_support` ≥ `UNIFORM_SINGLE_TOKEN_DECODE`，
+  `build()` **纯 pass-through** `common_attn_metadata` 的持久 GPU 张量（禁 `.tolist()`/`searchsorted`/
+  host sync），`forward` **单次 grid kernel** 驱动整 batch（禁 per-request python 循环）。
+- 现有 `PagedKVDecoder` 是**单序列**接口（`FlashDecodeKernel(...,1,...)` + `seq_id`），需要写一个
+  **batched paged decode**（一次 kernel 处理整 batch 单 token）+ 参照 `TritonAttentionMetadataBuilder`
+  重写 builder（`_cudagraph_support=ALWAYS`、pass-through、`build_for_cudagraph_capture` 里
+  `seq_lens.fill_(1)`）。**工程量大**，且 A1 已能拿走大部分 TPOT 收益 → **A2 视 A1 后的剩余差距再决定**。
+
+**结论**：**先 A1（配置级 piecewise）拿到有效 E2E**；若 attention 段间 eager 的开销仍显著（ncu/对比
+可测），再投 A2。**A1 不做，E2E 分数没有意义**（TPOT 项爆炸）。
 
 ### 轨-B：有损提速——追求**超过** flash 的 TTFT（砍 E2E 最大预算块）
 
