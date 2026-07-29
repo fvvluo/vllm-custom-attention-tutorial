@@ -10,6 +10,12 @@
 
 > **📊 评分怎么算（先看这个）**：接入你自己的 attention kernel 后，用**统一分数** `E2E = TTFT + 1000 × TPOT`（生成 1000 token 的端到端秒数，**越低越好**）来衡量。本教程 flash_attn 的 **baseline = `147s`**（单张 H20，~95k 输入实测），你的**加速比 = `147s / 你的 E2E 用时`**。起好服务后跑一条 `scripts/perf_test.py` 即可直接读出分数，详见 [**Part 4.2「评测你自己 kernel 的 E2E 分数」**](#42-评测你自己-kernel-的-e2e-分数一条命令)。
 
+> **📮 最终需要提交两张截图（缺一不可）**：
+> 1. **`correctness.png`** —— 跑 [Part 3 正确性测试](#part-3分页注意力正确性检测) `tests/test_paged_attn_correctness.py` 的输出截图，须显示 **`ALL PASS`**；
+> 2. **`performance.png`** —— 跑 [Part 4.2 性能测试](#42-评测你自己-kernel-的-e2e-分数一条命令) `scripts/perf_test.py`（默认参数：`--input-len 100000 --output-len 64`）的输出截图，须显示 `E2E 评分` 与最后一行 `[perf] SUMMARY ...`。
+>
+> **正确性是性能的前提**：`correctness.png` 必须先 `ALL PASS`，`performance.png` 的分数才有效——否则近似/丢 KV 的 kernel（如 sparse attention）可以只刷速度而不保证结果正确。两张图一起看，速度分才算数。
+
 ---
 
 ## 0. 环境与前置说明
