@@ -127,3 +127,22 @@ New file: `verify_paged_decode_v3_integrity.py` (only addition; no kernel change
 - **Still pending:** Nsight Systems timeline audit (not run this round).
 
 - Next (out of scope this round): deeper cp.async pipeline / PDL / wire into CUSTOM backend.
+
+## V4 — minimal CUSTOM-backend integration of V3 paged decode (synthetic-validated)
+New: `vllm_adapter_v4.py` (dispatch + `can_use_v3_decode` pure predicate + feature
+flag `LIUXIAOCHEN_PAGED_DECODE_V3`), `verify_v4_adapter.py`, `verify_v4_backend_forward.py`.
+Modified: `custom_triton_backend.py` (metadata `max_query_len`/`max_seq_len`; reroute
+only the READ to V3 when strictly supported). NO kernel change (diff 0 bytes).
+- **Real & PASS:** backend audit; packed-cache split-view = V3's alignment domain →
+  zero-copy; synthetic gate `logs/v4_synthetic_gpu1.log` (GPU 1, EXIT_CODE=0, 37/37):
+  adapter==direct V3 bit-identical, vs ref ≤5e-3, A→B→A stable, 7 fallback categories
+  correct, no silent clone.
+- **Resource-blocked (NOT code):** 3 Qwen3-32B BF16 engine-init attempts failed with
+  insufficient free memory (foreign servers on ports 8000/8004/8005/8007/8014/8020
+  seize freed GPUs during model load). No service-level hit evidence.
+- **Pending:** real service smoke (baseline+V4), service prefill-fallback/decode-hit
+  evidence, TTFT/TPOT/E2E. Do NOT treat synthetic PASS as service PASS.
+- To run when a GPU has ≥~75 GiB free: `GPU=<id> PORT=8403 MAX_LEN=8192
+  LIUXIAOCHEN_PAGED_DECODE_V3=0/1 bash scripts/serve_qwen3_custom_liuxiaochen.sh`
+  then `python scripts/smoke_test.py --port 8403`; V4 log should show
+  `[v4-dispatch] FIRST V3 decode HIT` and a prefill fallback line.

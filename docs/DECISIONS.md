@@ -171,3 +171,23 @@ change, no PDL, no extra stage, no CUSTOM-backend wiring. Full tables in WORKLOG
   points are labeled anomalous and kept; no re-run to fish for a better number.
 - **Still pending:** Nsight Systems timeline audit (not run this round). V3 remains NOT
   committed for V3.1 (this round is audit-only; no commit/push).
+
+## D10. V4 dispatch design (route supported decode to V3; keep Triton otherwise)
+- **Only the attention READ is rerouted**; the KV-cache WRITE
+  (`triton_reshape_and_cache_flash`) always runs. V3 reads the live packed-cache
+  split views in place — no clone/contiguous/gather/copy — because that layout
+  (slot-stride 2*hs, value offset +hs, last-dim contiguous, 16B-aligned) already
+  satisfies V3's cp.async alignment domain.
+- **Sync-free dispatch:** `can_use_v3_decode` uses the CPU scalars `max_query_len`
+  (==1 ⇒ pure decode) and shapes/strides/dtypes only — no `.item()`/`.max()`/`.cpu()`
+  on CUDA tensors, no allocation, no mutation. `max_seq_len` (CPU int) sizes the split.
+- **Metadata extension:** added `max_query_len`/`max_seq_len` to `CustomTritonMetadata`
+  and the builder (sourced from `CommonAttentionMetadata`, both CPU ints — no H<->D sync).
+- **Service-safety:** a first runtime error in V3 disables V3 for the process and falls
+  back to Triton (never crashes the server); unsupported inputs fall back silently to
+  the existing correct path. Feature flag defaults OFF (baseline) so integration is
+  opt-in and A/B-testable.
+- **Decision — commit synthetic-validated V4 now, keep service claims pending:** the
+  synthetic + real-forward gates prove dispatch correctness without a model; shared-GPU
+  contention repeatedly blocked BF16 engine init, so service smoke is recorded as
+  resource-blocked, NOT as a service PASS.

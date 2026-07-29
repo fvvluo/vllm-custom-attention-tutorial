@@ -312,3 +312,35 @@ order cannot misalign events; Stage-1-only vs end-to-end are separate series.
 ### Still pending
 - **Nsight Systems timeline audit** — not run this round.
 This round is audit-only: V3 is NOT committed/pushed for V3.1.
+
+---
+
+# V4 — minimal vLLM CUSTOM-backend integration (route supported decode to V3)
+
+V4 wires V3 into the live CUSTOM backend WITHOUT changing any V3/V2 kernel math
+(kernel diff = 0 bytes), no PDL, no extra stage, no new backend, no Prefill kernel.
+Files: `vllm_adapter_v4.py` (dispatch), `verify_v4_adapter.py` (synthetic gate),
+`verify_v4_backend_forward.py` (real-forward gate). `custom_triton_backend.py` gains
+`max_query_len`/`max_seq_len` in its metadata/builder and reroutes ONLY the attention
+read to V3 when the batch is strictly in the V3 support domain.
+
+## Dispatch
+`CustomTritonImpl.forward` always writes the KV cache
+(`triton_reshape_and_cache_flash`), then calls `try_v3_decode(...)`. If
+`can_use_v3_decode(...)` (a pure predicate: pure decode `max_query_len==1`, bf16,
+Hq64/Hkv8/D128/bs16, SM90, causal, finite positive scale, 16B-aligned
+last-dim-contiguous cache) returns True AND the flag is on, V3 runs in place on the
+LIVE tensors (zero-copy); otherwise the existing tutorial-Triton path runs. Any V3
+runtime error disables V3 for the process and falls back (never crashes the server).
+
+## Feature flag
+`LIUXIAOCHEN_PAGED_DECODE_V3`: `1` enables V3 inside the support domain; `0`/unset
+keeps the pure Triton baseline. Debug totals via `LIUXIAOCHEN_PAGED_DECODE_V3_DEBUG`.
+
+## Evidence boundary
+- **PASS (synthetic):** `logs/v4_synthetic_gpu1.log` (GPU 1, EXIT_CODE=0, 37/37) —
+  adapter-V3 == direct-V3 bit-identical on the packed split-view layout, vs PyTorch
+  ref ≤5e-3, output in place, A→B→A stable, 7 fallback categories correct, no silent clone.
+- **Resource-blocked (NOT code):** Qwen3-32B BF16 service could not start (shared-GPU
+  contention during model load). Real service smoke, service-level decode-hit / prefill-
+  fallback evidence, and TTFT/TPOT/E2E remain **pending** — synthetic PASS is not a service PASS.

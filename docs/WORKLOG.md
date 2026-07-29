@@ -202,3 +202,47 @@ process was killed; no card was auto-switched to stitch a single result set.
 - Logs: v3_1_integrity.log, v3_1_retest_process_a_gpu5.log,
   v3_1_retest_process_b_gpu3.log, v3_1_length_scaling_gpu3.log.
 - Historical stub (NOT this round's evidence): v3_1_integrity_import_failure_20260729_1912.log.
+
+## Phase V4 — minimal vLLM CUSTOM-backend integration of V3 paged decode (Liu Xiaochen)
+
+Goal: route STRICTLY-supported pure-decode CUSTOM attention calls to the V3
+cp.async paged-KV kernel; keep the existing tutorial-Triton path for everything
+else. NO kernel/MMA/cp.async/combine change (kernel diff = 0 bytes), no PDL, no
+extra stage, not a new backend, no Prefill kernel.
+
+New files: `vllm_adapter_v4.py` (dispatch), `verify_v4_adapter.py` (synthetic
+gate), `verify_v4_backend_forward.py` (real-forward gate). Modified:
+`custom_triton_backend.py` (+`max_query_len`/`max_seq_len` in metadata/builder;
+reroute only the READ to V3 when supported). Feature flag
+`LIUXIAOCHEN_PAGED_DECODE_V3` (1=on inside support domain, 0/unset=Triton baseline).
+
+### A. Directly verified (real, PASS)
+- Backend API + read-path audit: registration `plugin.py:register` →
+  `CustomTritonBackend`; forward `CustomTritonImpl.forward` writes KV via
+  `triton_reshape_and_cache_flash` then reads via `paged_attention_triton`.
+- Packed KV-cache layout `(num_blocks,Hkv,block_size,2*hs)` split into K/V half-views
+  → `stride(-1)==1`, slot-stride 2*hs, value offset +hs — exactly V3's cp.async
+  alignment domain, so V3 consumes the LIVE views zero-copy (no clone/contiguous/gather).
+- Feature flag on/off honored; `can_use_v3_decode` is a pure predicate (no alloc/
+  sync/mutation); dispatch evidence is low-frequency (first-hit + first-of-reason +
+  atexit totals).
+- **Synthetic adapter gate — PASS** (`logs/v4_synthetic_gpu1.log`, physical GPU 1,
+  EXIT_CODE=0, 37/37): adapter-V3 == direct-V3 **bit-identical** (max_abs 0) on the
+  packed split-view layout; V3 vs PyTorch reference ≤5e-3; output written in place
+  (data_ptr/shape/dtype OK); A→B→A stable (no first-tensor capture); seven fallback
+  categories (prefill / mixed / fp16 / head_dim / block_size / misaligned-stride /
+  non-causal) correctly rejected with reasons, no silent clone. Totals v3_hits=6.
+- V2/V3 kernel files unchanged (git diff = 0 bytes).
+
+### B. Attempted but resource-blocked (NOT a code failure)
+- Three Qwen3-32B BF16 engine-init attempts (GPU 1 ×1, GPU 2 ×2) all failed at
+  startup with `ValueError: Free memory on device cuda:0 (30.31 / 5.98 GiB) < desired
+  GPU memory utilization (0.9, 85.5 GiB)`. Shared host runs 6+ other Qwen3-32B servers
+  (ports 8000/8004/8005/8007/8014/8020) that seize any freed GPU within the ~30s
+  model-load window. These are NOT adapter/V3 CUDA errors; no service-level V3-hit
+  evidence was produced.
+
+### C. Not yet verified (service level)
+- Real service smoke (baseline + V4), service-level prefill fallback + decode hit,
+  TTFT/TPOT/E2E, HumanEval. These remain pending; do NOT read the synthetic PASS as a
+  service PASS.
