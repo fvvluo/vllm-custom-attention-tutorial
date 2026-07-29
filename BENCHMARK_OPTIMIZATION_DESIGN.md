@@ -393,6 +393,17 @@ CUDA OOM 崩溃**。根因：chunked prefill 的**后续 chunk**（q_len≈2048,
   fallback token 的 torch attention**。→ 这正是 B.1 矩形 causal 稀疏 kernel 要消灭的部分，也是 E2E
   从 1055s 砍向 <147s 的全部空间所在。
 
+**B.1 已完成 + 实测（2026-07-29，重大突破）**：矩形 causal 稀疏 kernel
+`ops/_wzc_attn_sparse_rect.py`（square kernel 的 context-offset 泛化，新文件不改现有）已实现，
+tau=1==dense 逐位无损（`_test_sparse_rect.py`/`test_wzc_chunked.py`：ctx=0/128/2048/4096/8192 +
+非 128 对齐 q_len + mixed batch 全 PASS）。适配器把 chunk（q_len<seq_len, context%128==0）路由到它。
+100k chunked+piecewise 实测（tau=0.999）：
+- **TTFT 793.7 → 134.7s（5.9× 更快，已在 flash 111.4s 的 1.2× 内）；E2E 1055 → 395s（2.7× 更好）。**
+- `[wzc-stats] fallback_tok=0`（全部 6.85M token 走 wzc kernel，torch 回退彻底消失）。
+- **剩余瓶颈完全转移到 TPOT=260ms**（decode ~3.8 tok/s）——E2E 里 1000×TPOT=260s ≫ TTFT 135s。
+  这不是 prefill/attention 问题，是 **decode 路径在 100k context 下的适配器开销**（疑似 block_size≠128
+  时每步 gather+repack 95k 历史，或 piecewise 下 decode 仍有大量非图开销）。→ 下一步诊断 TPOT。
+
 
 - **动作（按依赖排序）**：
   1. **B.0 修回退显存安全**（先做，小改动）：`_torch_causal_gqa` 的 einsum 分块（over q-rows 或
