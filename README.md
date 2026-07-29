@@ -10,11 +10,23 @@
 
 > **📊 评分怎么算（先看这个）**：接入你自己的 attention kernel 后，用**统一分数** `E2E = TTFT + 1000 × TPOT`（生成 1000 token 的端到端秒数，**越低越好**）来衡量。本教程 flash_attn 的 **baseline = `147s`**（单张 H20，~95k 输入实测），你的**加速比 = `147s / 你的 E2E 用时`**。起好服务后跑一条 `scripts/perf_test.py` 即可直接读出分数，详见 [**Part 4.2「评测你自己 kernel 的 E2E 分数」**](#42-评测你自己-kernel-的-e2e-分数一条命令)。
 
-> **📮 最终需要提交两张截图（缺一不可）**：
-> 1. **`correctness.png`** —— 跑 [Part 3 正确性测试](#part-3分页注意力正确性检测) `tests/test_paged_attn_correctness.py` 的输出截图，须显示 **`ALL PASS`**；
-> 2. **`performance.png`** —— 跑 [Part 4.2 性能测试](#42-评测你自己-kernel-的-e2e-分数一条命令) `scripts/perf_test.py`（默认参数：`--input-len 100000 --output-len 64`）的输出截图，须显示 `E2E 评分` 与最后一行 `[perf] SUMMARY ...`。
+> **📮 最终需要提交两项（每项都要「命令 + 该命令的输出截图」，缺一不可）**：
 >
-> **正确性是性能的前提**：`correctness.png` 必须先 `ALL PASS`，`performance.png` 的分数才有效——否则近似/丢 KV 的 kernel（如 sparse attention）可以只刷速度而不保证结果正确。两张图一起看，速度分才算数。
+> 1. **正确性**（详见 [Part 3](#part-3分页注意力正确性检测)）
+>    ```bash
+>    PYTHONPATH=../vllm_src:. python tests/test_paged_attn_correctness.py
+>    ```
+>    截图须包含**你敲的这条命令**和输出里的 **`ALL PASS`**。
+>
+> 2. **性能**（详见 [Part 4.2](#42-评测你自己-kernel-的-e2e-分数一条命令)，须用默认参数）
+>    ```bash
+>    python scripts/perf_test.py --input-len 100000 --output-len 64
+>    ```
+>    截图须包含**你敲的这条命令**和输出里的 `E2E 评分`、`加速比`、以及最后一行 `[perf] SUMMARY ...`。
+>
+> 截图里必须能看到命令本身（证明用的是原始脚本和默认参数，未改动）。
+
+> **正确性是性能的前提**：正确性命令必须先 `ALL PASS`，性能分数才有效——否则近似/丢 KV 的 kernel（如 sparse attention）可以只刷速度而不保证结果正确。两项一起看，速度分才算数。
 >
 > ⚠️ **正确性只以 [Part 3](#part-3分页注意力正确性检测) 的 `test_paged_attn_correctness.py` 为准**。教程里还有另外两个“验证”只是**辅助自检、不是评分依据**：Part 1.3 / 2.4 的**冒烟测试**（`smoke_test.py`，只问一道 `17+25` 看服务通不通）、Part 1.4 的 **HumanEval**（跑通演示用）。别拿这两个当正确性凭证。
 
@@ -474,7 +486,7 @@ PYTHONPATH=../vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32
 
 Part 2 里的 Triton attention 直接**接收分页 KV cache（paged KV cache）作为输入**。我们把它当作 **baseline**：你实现自己的 kernel 后，用同一份测试就能方便地校验正确性——无需启动整个 32B 服务。
 
-> ✅ **这是正确性的唯一评判标准**（要交的 `correctness.png` 就来自这里）。它直接把你 kernel 的输出与 PyTorch 参考实现**逐元素比对**，数值级精确、秒级、离线，`sparse` 等近似 kernel 在这里必然 FAIL。
+> ✅ **这是正确性的唯一评判标准**（要提交的正确性截图就截这条命令的输出）。它直接把你 kernel 的输出与 PyTorch 参考实现**逐元素比对**，数值级精确、秒级、离线，`sparse` 等近似 kernel 在这里必然 FAIL。
 >
 > 对比另外两个"验证"——它们**只是辅助，不能替代本测试**：
 > - **冒烟测试**（1.3 / 2.4，`smoke_test.py`）：只问一道 `17+25` 看服务通不通，1 道题、蒙对也算过，**只证明"服务能跑"，不证明"kernel 算对"**。
