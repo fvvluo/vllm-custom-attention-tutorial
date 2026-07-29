@@ -204,20 +204,24 @@ vLLM 调度器 (enable_chunked_prefill=True, max_num_batched_tokens=2048)
 
 **0.2 让稀疏 prefill 真正触发（BUG-2，二选一）**
 
-- **方案 0.2-A（快，改配置，推荐先做）**：serve 时**关 chunked prefill + 调大 batched tokens**，
-  使 100k prompt 作为**一次 pure-prefill**（`q_len==seq_len`）进入 `forward` → 现有 square kernel
-  （+尾部 padding）直接吃下。改 `serve_qwen3_custom.sh` 加：
-  ```
-  --no-enable-chunked-prefill --max-num-batched-tokens 102400
-  ```
-  代价：单次 forward 处理整段 100k，激活/中间显存更大（需与 KV cache 抢显存，可能要降
-  `--max-model-len` 或提 `--gpu-memory-utilization`）。**优点：零 kernel 改动即可让稀疏 kernel 在
-  评分路径上跑起来**，是验证「稀疏是否真能降 TTFT」的最快闭环。
-- **方案 0.2-B（稳，改 kernel，生产正道）**：让 prefill 内核/适配器支持 **context 偏移的矩形
-  causal**（chunked prefill：`q_len<seq_len`，query 行绝对位置 = `context + i`）。这是 vLLM 长
-  上下文的标准工作方式，不必调大 batched tokens。工作量：把 square kernel 的对角 mask 与
-  `n_block_max` 从「基于 q_blk 行」改为「基于 `context+q_blk 行`」，并让稀疏段选择在 context 上
-  做。**收益更通用**，但要动 CuTe kernel（有 719/barrier 等风险，见记忆库 pitfalls）。
+- **方案 0.2-A（快，改配置）**：serve 时**关 chunked prefill + 调大 batched tokens**，
+  使整段 prompt 作为**一次 pure-prefill**（`q_len==seq_len`）进入 `forward` → 现有 square kernel
+  （+尾部 padding）直接吃下。已落地为独立脚本 `scripts/serve_qwen3_wzc_sparse.sh`
+  （`WZC_SPARSE_BACKEND=1` + `--no-enable-chunked-prefill --max-num-batched-tokens=MAX_LEN`）。
+  **优点：零 kernel 改动即可让稀疏 kernel 在评分路径上跑起来。**
+  - ⚠️ **实测发现（2026-07-29，重要）**：**0.2-A 无法在单张 H20 上跑到 100k**。关掉 chunked
+    prefill 后整段 prompt 一次 forward，其**激活峰值**与 KV cache 抢显存——`MAX_LEN=102400 + 0.94`
+    时可用 KV 仅 **8.82 GiB**，而 102400 需 **25 GiB**，引擎启动即 `ValueError`（估算最大 ~36k）。
+    提高 util 也留不出足够 KV。**已在 `MAX_LEN=32768` 验证通过**：~28.7k pure-prefill，
+    `[wzc-stats] fallback_reqs=0 / max_kernel_seq=28757` → **稀疏 kernel 100% 触发、零 torch 回退**。
+  - 结论：0.2-A 只适合**中等长度（≤~32k）**验证稀疏机制；**100k 评分场景必须走 0.2-B**
+    （或多卡 TP 摊激活——但评分口径是单卡 H20，故不算）。
+- **方案 0.2-B（稳，改 kernel，生产正道；因上面的显存墙，现为 100k 评分的必经之路）**：让 prefill
+  内核/适配器支持 **context 偏移的矩形 causal**（chunked prefill：`q_len<seq_len`，query 行绝对
+  位置 = `context + i`）。保持 vLLM 默认的 chunked prefill（激活被限制在 chunk=2048 内，显存才够
+  100k KV），逐 chunk 用稀疏 kernel 处理 `q_len` 个 query 对 `context+q_len` 段的注意力。
+  工作量：把 square kernel 的对角 mask 与 `n_block_max` 从「基于 q_blk 行」改为「基于 `context+q_blk
+  行」，并让稀疏段选择在完整 context 上做。**要动 CuTe kernel**（有 719/barrier 等风险，见记忆库 pitfalls）。
 
 > 建议：先 0.2-A 打通闭环、拿到 TTFT 数字；确认稀疏有效后再投 0.2-B 做生产化。
 
@@ -298,7 +302,7 @@ E2E = TTFT(76%) + 1000×TPOT(24%)。正确性测试 `ALL PASS` 是所有方案�
 | 决策 | 选定 | 一句话理由 |
 |---|---|---|
 | **D1 先打通哪条闭环** | **(a) 先轨-0**，紧接 (b) 轨-A | 轨-0 零风险、先证明 prefill/稀疏能触发并拿 `correctness.png`；但 E2E 有效分要靠轨-A |
-| **D2 chunked prefill 解法** | **先 (a) 配置法，后 (b) kernel 法** | 配置法零 kernel 改动即可让稀疏 kernel 在评分路径跑起来；验证有效后再投 kernel 化做生产正道 |
+| **D2 chunked prefill 解法** | **0.2-A 已验证机制（≤32k）；100k 必走 0.2-B** | 实测 0.2-A 关分块后单 forward 激活+KV 撑爆单卡 H20（100k 需 25GiB KV、仅剩 8.82GiB）；32k 已验证稀疏 kernel 零回退触发 |
 | **D3 精度预算** | **(a)→(b) 递进**，(c) fp8 视收益再定 | 先无损把 E2E 追平/微超守正确性；再开 sparse 换 TTFT（tau=1 必过正确性测试）；fp8 收尾可选 |
 | **D4 E2E 主攻项** | **先 TPOT（轨-A 入场券）再 TTFT（轨-0+B 主战场）** | 不做 CUDA graph，TPOT 项直接把总分拖垮；拉正后 TTFT(76%) 才是拉开加速比的地方 |
 
@@ -311,19 +315,19 @@ E2E = TTFT(76%) + 1000×TPOT(24%)。正确性测试 `ALL PASS` 是所有方案�
 
 每个阶段有明确**入口→动作→验收 gate**；未过 gate 不进下一阶段。测速纪律见文末。
 
-### 阶段 0 —— 解阻塞（对应 D1-a / D2-a，零风险，先做）
+### 阶段 0 —— 解阻塞（对应 D1-a / D2-a，零风险，先做）—— ✅ 已完成（2026-07-29）
 - **动作**：
   1. 修 **BUG-1**：`custom_backend/wzc_sparse_attention.py` 的 `_load_kernel()` 改
-     `from ops import _wzc_attn_sparse as k`，订正 docstring 里 c4/c5 引用。
-  2. 回归 `tests/test_wzc_sparse.py`、`tests/test_wzc_decode.py`（应全绿）。
-  3. 改 `scripts/serve_qwen3_custom.sh`：加 `--no-enable-chunked-prefill --max-num-batched-tokens 102400`
-     （**D2-a**，让 100k prompt 作为一次 pure-prefill 进 `forward`，触发 square 稀疏 kernel）。
-- **验收 gate**：
-  - `tests/test_paged_attn_correctness.py` → **`ALL PASS`**（产出 `correctness.png`）。
-  - `WZC_SPARSE_STATS=1` serve 下发 100k 请求，日志出现 `kernel_reqs` 递增、`max_kernel_seq` 逼近
-    ~95k（**证明稀疏 kernel 真的在评分路径上跑，而非 torch 回退**）。
-  - `perf_test.py --input-len 100000`（tau=1 无损）拿到 TTFT。**注意**：此时 decode 仍 eager，
-    E2E 总分不看，仅记 TTFT 单项。
+     `from ops import _wzc_attn_sparse as k`，订正 docstring 里 c4/c5 引用。✅
+  2. 回归 `tests/test_wzc_sparse.py`、`tests/test_wzc_decode.py`。✅ 均 `ALL PASS`。
+  3. 新增 `scripts/serve_qwen3_wzc_sparse.sh`（不改教学脚本）：`WZC_SPARSE_BACKEND=1` +
+     `--no-enable-chunked-prefill --max-num-batched-tokens=MAX_LEN` + YaRN + `WZC_SPARSE_STATS=1`。✅
+- **验收 gate（实测结果）**：
+  - `tests/test_paged_attn_correctness.py` → **`ALL PASS`** ✅（prefill 7.8e-3 / decode 3.9e-3 / mixed 7.8e-3）。
+  - 起服务（GPU 1，`MAX_LEN=32768`）发 ~28.7k 请求，日志 **`[wzc-stats] fallback_reqs=0
+    max_kernel_seq=28757`** ✅ → **稀疏 kernel 100% 触发、零 torch 回退**，机制打通。
+  - ⚠️ **`MAX_LEN=102400` 启动即 OOM**（关分块→单 forward 激活+KV 抢显存，KV 仅 8.82GiB<25GiB 需求）。
+    → **100k 评分必须走阶段 0.2-B（kernel 支持 chunked/context prefill），不能靠配置法**。见 §5 轨-0 更新。
 
 ### 阶段 A —— 拉正 TPOT，拿有效 E2E（对应 D4「入场券」，工程重但必做）
 - **入口**：阶段 0 gate 通过。
