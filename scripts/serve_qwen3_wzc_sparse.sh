@@ -103,6 +103,14 @@ else
                  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
 fi
 
+# ---- 可选 fp8 权重量化（压 MLP/QKVO GEMM 地板）----
+# QUANT=fp8：在线动态量化 bf16 checkpoint 的线性层权重到 fp8，走 H20 fp8 tensor core
+#   (~2×)，把 100k prefill 里 ~43s 的 MLP/GEMM 地板降到 ~21s（attention 由 wzc 稀疏另算）。
+#   有损，需 HumanEval 守质量。QUANT 留空则 bf16（默认）。
+QUANT="${QUANT:-}"
+QUANT_ARGS=()
+[[ -n "${QUANT}" ]] && QUANT_ARGS+=(--quantization "${QUANT}")
+
 exec python -m vllm.entrypoints.openai.api_server \
     --model "${MODEL}" \
     --served-model-name "${SERVED_NAME}" \
@@ -111,6 +119,7 @@ exec python -m vllm.entrypoints.openai.api_server \
     --max-model-len "${MAX_LEN}" \
     --block-size "${BLOCK_SIZE}" \
     --attention-backend CUSTOM \
+    "${QUANT_ARGS[@]}" \
     "${CHUNK_ARGS[@]}" \
     "${EAGER_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
