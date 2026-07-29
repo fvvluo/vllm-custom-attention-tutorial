@@ -385,6 +385,15 @@ CUDA OOM 崩溃**。根因：chunked prefill 的**后续 chunk**（q_len≈2048,
 - 已验证：矩形 causal 稀疏**算法**（`ops/_wzc_sparse_rect_ref.py` torch 参考）tau=1==dense
   逐位一致（max_err ~1e-7，ctx=0/2048/4096），算法正确性已锁定，可作未来 kernel 的金标准。
 
+**B.0 已完成 + 100k 基线（2026-07-29）**：`_torch_causal_gqa` 改为 over-q-rows 分块（`Q_CHUNK=64`，
+峰值 ~195MB），数值对拍 dense 参考 max_err ~1e-7，decode/mixed 测试全绿。**100k 不再 OOM、能跑通**：
+- **TTFT=793.7s、TPOT=261.6ms、E2E=1055s**（vs flash TTFT 111.4 / E2E 147 → 当前 **7× 差**）。
+- `[wzc-stats]`：`kernel_tok=1.25M`（chunk0 ~95k pure-prefill 走稀疏 kernel，`max_kernel_seq=95721`）
+  + `fallback_tok=5.6M`（~46 个后续 chunk 走**显存安全但慢**的 torch）。**793s 里绝大部分 = 5.6M
+  fallback token 的 torch attention**。→ 这正是 B.1 矩形 causal 稀疏 kernel 要消灭的部分，也是 E2E
+  从 1055s 砍向 <147s 的全部空间所在。
+
+
 - **动作（按依赖排序）**：
   1. **B.0 修回退显存安全**（先做，小改动）：`_torch_causal_gqa` 的 einsum 分块（over q-rows 或
      kv-cols）避免物化 `(q_len, group, seq)`，让 100k chunked 至少**能正确跑通**（慢但不崩）→ 建立
