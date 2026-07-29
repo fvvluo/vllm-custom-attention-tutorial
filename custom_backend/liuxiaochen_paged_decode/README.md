@@ -103,3 +103,175 @@ there) to overlap load with warp-MMA. V2 (this doc) is the frozen sync baseline.
 ## Limitations
 Decode-only; fixed 64/8/128/16 shape; sync load; no cp.async/PDL; not wired to
 CUSTOM backend; multi-seq scaling weak.
+
+---
+
+# V3 — cp.async Double-Buffered Paged-KV warp-MMA Decode (Liu Xiaochen)
+
+**V3 is V2 with EXACTLY ONE variable changed:** the synchronous per-element paged
+K/V load is replaced by a **cp.async 2-stage (2K+2V) double-buffered** pipeline
+that prefetches the next 64-token logical tile while the warp-MMA consumes the
+current one. Everything else — MMA atoms, QK/PV fragment mapping, tail masking,
+online-softmax math, Split-KV schedule, empty-split neutral representation, packed
+output, and the reused V2 combine — is byte-for-byte identical to V2. **V3 output
+is bit-identical to V2 (`torch.equal` True) in every correctness case.** Still NOT
+wired to the active CUSTOM backend.
+
+Files: `paged_decode_stage1_v3.py`, `runner_v3.py`, `verify_paged_decode_v3.py`,
+`bench_paged_decode_v3.py`, `ncu_stage1_probe.py`. Reuses `paged_decode_combine_v2.py`
+(not copied). identity: `liuxiaochen-paged-decode-v3-mma-cpasync-2stage`.
+
+## Evidence boundary (log-backed vs author-asserted vs pending)
+The V3 numbers below are recorded honestly against what the logs actually contain.
+Read this classification before citing any V3 result.
+
+**A. Directly supported by existing logs** (`logs/v3_*.log`):
+- V3 vs V2 **bit-identical** (`max_abs=0.000e+00`, `torch.equal`=True).
+- Full **correctness matrix PASS** (tutorial 2e-2 + strict 5e-3-vs-ref).
+- **Benchmark `EXIT=0`** on every bench segment.
+- **128K split=256 V3 end-to-end ≈ 0.245 ms** (and the rest of the split/seqlen/multi-seq tables).
+- **Nsight metric values** (HMMA count, DRAM throughput, long-scoreboard, tensor-pipe, regs, SMEM).
+- **identity vs shuffle** block_table penalty numbers.
+- **no register spill** (`local ld/st = 0`).
+
+**B. Author-asserted only — NOT recorded in any log** (do not treat as verified):
+- The physical GPU used (documented as "GPU 1/6") — logs only recorded `device: cuda:0`,
+  and did not capture the physical index or `CUDA_VISIBLE_DEVICES`.
+- The exact full `CUDA_VISIBLE_DEVICES=… python …` command lines.
+- The real **shell exit code of the `ncu` runs** — the ncu logs end at the metrics table
+  with no `EXIT=` sentinel.
+
+**C. NOT executed (planned, no artifacts on disk):**
+- V3.1 **two-GPU independent-process retest**.
+- V3.1 **Part VI length scaling**.
+- **pointer rebinding / stale workspace** dedicated audit.
+- **Nsight Systems timeline** audit.
+
+None of the items in B or C may be reported as PASS.
+
+> V3.1 measurement-integrity audit remains pending and should be
+> performed in the dedicated per-user container or another clean GPU
+> environment. This does not invalidate the existing V3 correctness,
+> benchmark, or Nsight evidence.
+
+## Paged cp.async addressing
+A 64-token logical tile = 4 logical KV blocks (`block_size=16`). For tile `t`:
+```
+tile_start   = split_start + t*64
+logical_block_j = (tile_start//16) + j          # j = 0,1,2,3
+physical_block_j = block_table[seq, logical_block_j]
+cp.async key_cache[physical_block_j, kv_head, 0:16, 0:128] -> SMEM rows [16j:16j+16]
+cp.async value_cache[physical_block_j, kv_head, 0:16, 0:128] -> SMEM rows [16j:16j+16]
+```
+All **4 K sub-copies + 4 V sub-copies of a tile form ONE cp.async commit group**
+(`cp_async_commit_group()`), issued into logical row order (no gather, no
+contiguous workspace, no physical-block sorting). A fully-invalid logical block
+(`block_start_tok >= seq_len`) is NOT resolved through block_table (no OOB
+address) and its SMEM rows are deterministically zero-filled; partially-valid
+tiles are masked to `-inf` in QK, identical to V2. Branches are warp-uniform.
+
+## Pipeline (prologue / steady / epilogue)
+- **Prologue**: load Q once (scalar); prefetch tile 0 (8 sub-copies) → 1 commit group.
+- **Steady** (tile t): if t+1 exists, prefetch tile t+1 into the other stage →
+  `commit_group()` → `cp_async_wait_group(1)` (≤1 group in flight: tile t ready,
+  t+1 loading) → `sync_warp` → QK→mask→softmax→PV on stage[t%2] → `sync_warp` → ping-pong.
+- **Epilogue** (last tile): no prefetch; `cp_async_wait_group(0)`; compute; write partial_o/lse.
+
+## SMEM layout (2K + 2V, matching validated B6; NOT B8-S's 2K+1V)
+`sQ` single-buffered; `sK`/`sV` each 2 stages of `[64,128]` BF16 with
+`swizzle(3,3,3)` (ldmatrix-compatible). Dynamic SMEM/CTA (ncu) = **69.63 KB**
+(V2 = 36.86 KB); registers/thread = **181** (V2 = 168), **no spill** (local
+ld/st = 0). cp.async copy atom = `CopyG2SOp(GLOBAL)`, 128-bit vectors,
+thr_layout (4,8) × val (1,8) — reused from B6's validated tiling for this swizzle.
+
+## cp.async alignment domain (runner raises, never silently fixes)
+`_check_cpasync_alignment` requires `stride(-1)==1`, `data_ptr()` 16-byte aligned,
+and block/head/slot strides multiples of 8 bf16 (16 B) so every token-row start is
+16-byte aligned. Covers standard contiguous cache AND V2's padded-leading stride
+(D+8 backing sliced to D → slot-stride 136, still 8-multiple). Violations raise
+`ValueError` — no clone/contiguous/sync-fallback/triton-fallback.
+
+## Correctness (V3 == V2 bit-identical; strict 5e-3-vs-ref; tutorial 2e-2)
+ALL PASS, `V3==V2` = YES (max_abs 0.000e+00) in every case:
+- basic {1,15,16,17,63,64,65,127,128,129,512} × seed {0,1,2026}
+- tutorial [40,17,128]; irregular [1,17,65,257]/[127,128,129,1023]
+- shuffle {0,1,2026}; padded-leading-stride; scale {default,0.05}
+- big [40,512,8192], [131072], [8192,32768,131072] (shuffled).
+
+## Microbenchmark (H20, warmup=10/iters=100/rounds=5, CUDA-event, same input, random order)
+
+### 128K single, split sweep (best = split 256)
+| split | nsm | V2 S1 ms | V3 S1 ms | V3 e2e ms | V3 vs V2 | V3 vs Triton | V3 GB/s (K+V) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| **256** | 512 | 3.194 | **0.220** | **0.245** | **13.15x** | 319.7x | 2193 |
+| 512 | 256 | 3.508 | 0.371 | 0.383 | 9.22x | 204.6x | 1403 |
+| 1024 | 128 | 4.192 | 0.578 | 0.578 | 7.27x | 135.4x | 929 |
+
+### per-seq-len (num_seqs=1, split=256)
+| seq_len | V2 S1 ms | V3 S1 ms | V3 e2e ms | V3 vs V2 | V3 vs Triton |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 0.086 | 0.011 | 0.098 | 0.99x (fixed-overhead) | 0.52x |
+| 512 | 0.167 | 0.013 | 0.099 | 1.74x | 1.96x |
+| 8192 | 0.180 | 0.025 | 0.098 | 1.90x | 31.3x |
+| 32768 | 1.052 | 0.064 | 0.099 | 10.77x | 198.3x |
+| 131072 | 3.194 | 0.220 | 0.245 | 13.15x | 319.6x |
+
+### multi-sequence (seq_len=8192, split=256)
+| num_seqs | V2 S1 ms | V3 S1 ms | V3 e2e ms | V3 vs V2 | V3 vs Triton | tokens/s |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.180 | 0.025 | 0.098 | 1.90x | 31.3x | 10207 |
+| 4 | 1.061 | 0.065 | 0.100 | 10.63x | 48.5x | 39790 |
+| 16 | 3.203 | 0.219 | 0.231 | 13.92x | 22.2x | 69224 |
+V3 scales far better than V2 across num_seqs (cp.async keeps the SMs fed as heavy
+warps accumulate), so V3's lead over V2 grows with load rather than shrinking.
+
+### block_table identity vs shuffle (V3 Stage-1)
+<!-- "clean GPU" here is author-assertion; the run's physical GPU / CUDA_VISIBLE_DEVICES
+     was not captured in the log (see Evidence boundary, item B). -->
+
+| seq_len | identity S1 ms | shuffle S1 ms | penalty |
+|---:|---:|---:|---:|
+| 8192 | 0.0250 | 0.0250 | ~0% |
+| 32768 | 0.0637 | 0.0643 | ~0.9% |
+| 131072 | 0.2187 | 0.2197 | ~0.5% |
+On a clean GPU the paged block_table permutation costs **<1%** for both V2 and V3
+— block_table lookup is confirmed NOT a bottleneck (this supersedes V2's contended
+32768 anomaly).
+
+## Nsight (V2 vs V3 Stage-1, 128K split=256 shuffle)
+<!-- "clean-ish GPU" is author-assertion; physical GPU / CUDA_VISIBLE_DEVICES and the
+     ncu shell exit code were not captured in logs (see Evidence boundary, item B). -->
+
+| metric | V2 sync | V3 cp.async | evidence |
+|---|---:|---:|---|
+| HMMA count | 2097152 | 2097152 | math unchanged |
+| Stage-1 latency | 3.27 ms | 0.242 ms | 13.5x faster |
+| DRAM throughput | 170 GB/s (4.2%) | 2.29 TB/s (56.9%) | load overlapped |
+| long-scoreboard stall/issue | 20.90 | 0.86 | memory dependency gone |
+| tensor pipe active | 0.73% | 10.12% | MMA fed |
+| regs/thread | 168 | 181 | no spill (local ld/st = 0) |
+| dyn SMEM/CTA | 36.86 KB | 69.63 KB | 2K+2V |
+All 7 success-evidence checks pass: HMMA unchanged, cp.async present (DRAM 2.29 TB/s
++ long-scoreboard collapse), latency down, DRAM up, no spill, output unchanged.
+
+## Bottleneck (V3) & next
+V3 Stage-1 now runs at **~57% of DRAM peak (2.29 TB/s)** — memory-bandwidth bound,
+which is the correct regime for decode. Remaining headroom vs continuous B7
+(~2.88 TB/s) is the paged sub-copy granularity (4 physical blocks/tile vs one
+contiguous block) and 2-stage depth. Next candidates (out of scope this round):
+deeper cp.async pipeline (3-4 stage), PDL, or wiring into the CUSTOM backend.
+
+## V3 limitations
+Decode-only; fixed 64/8/128/16 shape; 2-stage depth; no PDL; not wired to CUSTOM
+backend; requires 16-byte-aligned contiguous-D paged cache (raises otherwise).
+
+## V3.1 pending (NOT executed this round — no artifacts on disk)
+The following are planned but have **no logs, no result files, no commits** yet;
+they must be run in a dedicated per-user container or another clean GPU environment
+(the current shared machine has no clean GPU):
+- two-GPU **independent-process retest** of correctness + benchmark;
+- **Part VI length scaling**;
+- **pointer rebinding / stale workspace** dedicated audit;
+- **Nsight Systems timeline** audit.
+
+None of these are PASS. See "Evidence boundary" above.

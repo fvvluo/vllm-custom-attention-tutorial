@@ -5,5 +5,6 @@ NOT registered as the active CUSTOM backend; standalone correctness/perf prototy
 """
 
 from .runner_v2 import paged_decode_v2, workspace_bytes
+from .runner_v3 import paged_decode_v3
 
-__all__ = ["paged_decode_v2", "workspace_bytes"]
+__all__ = ["paged_decode_v2", "paged_decode_v3", "workspace_bytes"]

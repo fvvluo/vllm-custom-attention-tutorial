@@ -57,3 +57,62 @@ both released after use. No processes killed except my own serve (SIGINT).
   V2 is sync-load; bottleneck = synchronous paged K/V load (latency-bound).
 - Logs: v2_verify_basic/suites/big.log, v2_bench_small/128k_split_sweep/multiseq/blocktable.log
 - V2 frozen as the sync baseline. Next: V3 cp.async double-buffer (overlap load).
+
+## Phase V3 — cp.async double-buffered paged-KV warp-MMA decode (Liu Xiaochen)
+
+- ONE variable changed vs V2: sync per-element paged load → **cp.async 2-stage
+  (2K+2V) double buffer**. New files stage1_v3/runner_v3/verify_v3/bench_v3 +
+  ncu_stage1_probe; reuses combine_v2 (not copied). V2 files unchanged (git diff empty).
+  identity `liuxiaochen-paged-decode-v3-mma-cpasync-2stage`.
+- cp.async addressing: 64-token tile = 4 logical blocks; each resolved via
+  block_table to a physical block, whole [16,128] issued cp.async → SMEM rows
+  [16j:16j+16] in logical order. 4 K + 4 V sub-copies = ONE commit group.
+  Fully-invalid block never touches block_table (no OOB), zero-filled; partial tile
+  masked to -inf in QK. Prologue prefetch tile0; steady: prefetch t+1 →
+  commit → wait_group(1) → compute t → ping-pong; epilogue wait_group(0).
+- Correctness: **V3 == V2 bit-identical (torch.equal True, max_abs 0.000e+00) in
+  EVERY case** — basic {1..512}×seed{0,1,2026}, tutorial, irregular, shuffle{0,1,2026},
+  padded-stride, scale, big [40,512,8192]/[131072]/[8192,32768,131072]. strict 5e-3
+  + tutorial 2e-2 all PASS.
+- Perf (H20, same input, random order). **128K split=256: V3 0.245ms e2e vs V2
+  3.221ms = 13.15x, 319x vs Triton, 2193 GB/s (K+V).** Split sweep best=256
+  (512=0.383ms/9.2x, 1024=0.578ms/7.3x). Per-seq: 8192 1.90x, 32768 10.8x, 131072
+  13.15x over V2. Multi-seq 8192: ns4 10.6x, ns16 13.9x over V2 (V3 scales UP with
+  load, opposite of V2). combine still ~0.3%.
+- Gate: required 128K split=256 < 3.221ms and ≥15% (≤2.74ms). **Achieved 0.245ms
+  — far beyond (13.15x).**
+- block_table identity vs shuffle: 8192 ~0%, 32768 ~0.9%, 131072 ~0.5%
+  penalty — confirms lookup <1%, NOT a bottleneck (supersedes V2's contended 32768).
+- Nsight (V2 vs V3 Stage-1, 128K split=256): HMMA 2097152 unchanged; latency
+  3.27ms→0.242ms; DRAM 170 GB/s→2.29 TB/s (57% peak); long-scoreboard stall/issue
+  20.90→0.86; tensor pipe 0.73%→10.12%; regs 168→181, NO spill (local ld/st 0);
+  dyn SMEM 36.86KB→69.63KB (2K+2V). All 7 success-evidence items pass.
+- Bottleneck now: DRAM-bandwidth bound at ~57% peak (correct decode regime).
+  Headroom vs continuous B7 (~2.88 TB/s) = paged sub-copy granularity + 2-stage depth.
+- Logs: v3_verify_all.log, v3_verify_big.log, v3_bench_128k_split_sweep.log,
+  v3_bench_seqlens.log, v3_bench_blocktable.log, v3_ncu_v2.log, v3_ncu_v3_full.log.
+- NOT committed/pushed. NOT wired to CUSTOM backend. Archive
+  /tmp/liuxiaochen_before_v3_cpasync.tar.gz (sha256 6a7d3ace…5b9bd).
+
+### V3 evidence boundary (honest scope of proof)
+- **A. Directly supported by logs** (`logs/v3_*.log`): V3==V2 bit-identical
+  (max_abs 0.000e+00); correctness matrix PASS (2e-2 + strict 5e-3); benchmark
+  `EXIT=0` on every segment; 128K split=256 V3 e2e≈0.245ms; Nsight metric values;
+  identity/shuffle penalties; no register spill.
+- **B. Author-asserted only, NOT recorded in any log** (not verified): the physical
+  GPU used (worklog says "idle GPU 1/6" — logs only recorded `device: cuda:0`, with
+  no physical index and no `CUDA_VISIBLE_DEVICES`); the exact full command lines;
+  the real **shell exit code of the `ncu` runs** (ncu logs end at the metrics table,
+  no `EXIT=` sentinel).
+- **C. NOT executed — planned, zero artifacts on disk:** V3.1 two-GPU
+  independent-process retest; V3.1 Part VI length scaling; pointer rebinding /
+  stale workspace dedicated audit; Nsight Systems timeline audit.
+- None of the B or C items are PASS and must not be recorded as such.
+
+> V3.1 measurement-integrity audit remains pending and should be
+> performed in the dedicated per-user container or another clean GPU
+> environment. This does not invalidate the existing V3 correctness,
+> benchmark, or Nsight evidence.
+
+- GPU discipline: intended to use an idle GPU; runtime device index was not
+  captured in the logs (see item B).
