@@ -30,7 +30,15 @@
 | Triton | 3.7.1 |
 | CUDA (nvcc) | 13.0 |
 | vLLM（已装 wheel） | `0.18.1rc1.dev3933+ga49d37c6b`，对应 commit **`a49d37c6b`** |
-| 模型 | `/dockerdata/models/Qwen3-32B` |
+| 模型 | `/dockerdata/models/Qwen3-32B`（**镜像内固定路径，两台机器一致，直接保留即可**；如你的模型在别处，用 `MODEL=/your/path` 覆盖） |
+
+> **先把本仓库 clone 到本地任意目录**，后续所有命令都在仓库根目录执行（示例里的 `cd <你的仓库路径>` 换成你实际 clone 的位置）。vLLM 源码**不在本仓库里**，会由 `scripts/setup_vllm_source.sh` 克隆到仓库的**兄弟目录** `../vllm_src`，最终目录结构为：
+>
+> ```
+> 你clone的位置/
+> ├── <本仓库>/     # vllm-custom-attention-tutorial
+> └── vllm_src/     # setup 脚本克隆的 vLLM 源码（不纳入本仓库）
+> ```
 
 关键点：**镜像里已经用 wheel 装好了 vLLM，且它的 commit 正好就是本教程要求的 `a49d37c6b`**，编译好的 CUDA 扩展（`.so`）都在。我们不重新编译 CUDA，而是：
 
@@ -49,19 +57,19 @@
 ### 1.1 准备 vLLM 源码（一次性）
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
+cd <你的仓库路径>   # 你 clone 本仓库的位置
 bash scripts/setup_vllm_source.sh
 ```
 
 这个脚本会：
-- clone vLLM 到 `/dockerdata/landojiang/vllm_src` 并 checkout `a49d37c6b`；
+- clone vLLM 到仓库的**兄弟目录** `../vllm_src` 并 checkout `a49d37c6b`；
 - 把已安装包的 16 个 `.so` + `_version.py` 软链接到源码树；
 - 校验 `import vllm` 来自源码树、且 `vllm._C_stable_libtorch` 可用。
 
 **预期输出结尾**：
 
 ```
-  vllm.__file__ = /dockerdata/landojiang/vllm_src/vllm/__init__.py
+  vllm.__file__ = .../vllm_src/vllm/__init__.py
   vllm._C_stable_libtorch: OK
   torch: 2.13.0+cu130 cuda: 13.0
   vllm.__version__: 0.18.1rc1.dev3933+ga49d37c6b
@@ -71,7 +79,7 @@ SETUP OK
 之后所有命令都要让源码树在 `PYTHONPATH` 最前面：
 
 ```bash
-export PYTHONPATH=/dockerdata/landojiang/vllm_src:$PYTHONPATH
+export PYTHONPATH=../vllm_src:$PYTHONPATH
 ```
 
 （下面的启动脚本已自动帮你设置，无需手动 export。）
@@ -81,14 +89,14 @@ export PYTHONPATH=/dockerdata/landojiang/vllm_src:$PYTHONPATH
 在**第一个终端**里启动：
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
+cd <你的仓库路径>   # 你 clone 本仓库的位置
 GPU=0 PORT=8000 bash scripts/serve_qwen3_flashattn.sh
 ```
 
 脚本核心命令（供理解）：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/dockerdata/landojiang/vllm_src \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=../vllm_src \
 python -m vllm.entrypoints.openai.api_server \
     --model /dockerdata/models/Qwen3-32B \
     --served-model-name qwen3-32b \
@@ -109,8 +117,8 @@ python -m vllm.entrypoints.openai.api_server \
 在**第二个终端**里跑冒烟测试（会自动等待服务就绪）：
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
-PYTHONPATH=/dockerdata/landojiang/vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32b
+cd <你的仓库路径>   # 你 clone 本仓库的位置
+PYTHONPATH=../vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32b
 ```
 
 冒烟测试会发一道**答案确定**的算术题（`17 + 25`），并校验回答里是否出现正确答案 `42`——只“非空”不算通过，必须**算对**才算通过。这样能真正验证后端计算是否正确（下文 Part 2 会解释为什么这点很重要）。
@@ -156,13 +164,13 @@ pip install openai
 **第 1 步：起好服务**（1.2 的 flash_attn 或 Part 2 的 CUSTOM 后端均可），在**另一个终端**生成补全：
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
+cd <你的仓库路径>   # 你 clone 本仓库的位置
 # 先快速冒烟（前 20 题），确认链路通
-PYTHONPATH=/dockerdata/landojiang/vllm_src python scripts/humaneval_generate.py \
+PYTHONPATH=../vllm_src python scripts/humaneval_generate.py \
     --port 8000 --model qwen3-32b --limit 20
 
 # 跑完整 164 题（并发 4 条请求加速）
-PYTHONPATH=/dockerdata/landojiang/vllm_src python scripts/humaneval_generate.py \
+PYTHONPATH=../vllm_src python scripts/humaneval_generate.py \
     --port 8000 --model qwen3-32b --concurrency 4 \
     --output logs/humaneval_samples.jsonl
 ```
@@ -170,7 +178,7 @@ PYTHONPATH=/dockerdata/landojiang/vllm_src python scripts/humaneval_generate.py 
 **第 2 步：在沙箱里评测，得到 pass@1**：
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
+cd <你的仓库路径>   # 你 clone 本仓库的位置
 python scripts/humaneval_evaluate.py \
     --samples logs/humaneval_samples.jsonl \
     --timeout 10 --workers 8 \
@@ -251,7 +259,7 @@ custom_triton = "custom_backend.plugin:register"
 **安装（一次性，注册 entry point）**：
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
+cd <你的仓库路径>   # 你 clone 本仓库的位置
 pip install -e .
 ```
 
@@ -262,14 +270,14 @@ pip install -e .
 在**第一个终端**启动（脚本已设好 `PYTHONPATH` 和 `--enforce-eager --attention-backend CUSTOM`）：
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
+cd <你的仓库路径>   # 你 clone 本仓库的位置
 GPU=0 PORT=8000 bash scripts/serve_qwen3_custom.sh
 ```
 
 脚本核心命令（供理解）：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/dockerdata/landojiang/vllm_src \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=../vllm_src \
 python -m vllm.entrypoints.openai.api_server \
     --model /dockerdata/models/Qwen3-32B \
     --served-model-name qwen3-32b \
@@ -295,8 +303,8 @@ Application startup complete.
 在**第二个终端**跑同一个冒烟测试：
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
-PYTHONPATH=/dockerdata/landojiang/vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32b
+cd <你的仓库路径>   # 你 clone 本仓库的位置
+PYTHONPATH=../vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32b
 ```
 
 **预期**（已实测，与 flash attn 后端结果一致）：
@@ -352,8 +360,8 @@ def paged_attention_triton(
 测试 `tests/test_paged_attn_correctness.py` 会构造分页 KV cache，把 `paged_attention_triton` 的输出与一份**朴素 PyTorch 参考实现**逐元素比对，覆盖 **prefill / decode / 混合** 三种场景。
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
-PYTHONPATH=/dockerdata/landojiang/vllm_src:. python tests/test_paged_attn_correctness.py
+cd <你的仓库路径>   # 你 clone 本仓库的位置
+PYTHONPATH=../vllm_src:. python tests/test_paged_attn_correctness.py
 ```
 
 **预期输出**（bf16 容差 `rtol=atol=2e-2`，已实测）：
@@ -421,7 +429,7 @@ rope_scaling            = None
 用一张**空闲卡**并适当调高 `--gpu-memory-utilization`）：
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
+cd <你的仓库路径>   # 你 clone 本仓库的位置
 HF_OVERRIDES='{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":40960},"max_position_embeddings":163840}' \
 MAX_LEN=102400 GPU_MEM_UTIL=0.94 GPU=4 PORT=8004 \
 bash scripts/serve_qwen3_flashattn.sh
@@ -436,7 +444,7 @@ bash scripts/serve_qwen3_flashattn.sh
 在**第二个终端**跑性能测试：
 
 ```bash
-cd /dockerdata/landojiang/vllm_tutorial
+cd <你的仓库路径>   # 你 clone 本仓库的位置
 python scripts/perf_test.py --port 8004 --input-len 100000 --output-len 64
 ```
 
@@ -523,11 +531,11 @@ E2E(s)    = TTFT + 1000 × TPOT            # 例：111.411 + 1000 × 0.03557 ≈
 
 ```bash
 # 第一个终端：CUSTOM 后端，小上下文即可（无需 YaRN）
-cd /dockerdata/landojiang/vllm_tutorial
+cd <你的仓库路径>   # 你 clone 本仓库的位置
 GPU=5 PORT=8005 bash scripts/serve_qwen3_custom.sh
 
 # 第二个终端：用小 --input-len 测（如 2048）
-cd /dockerdata/landojiang/vllm_tutorial
+cd <你的仓库路径>   # 你 clone 本仓库的位置
 python scripts/perf_test.py --port 8005 --input-len 2048 --output-len 32
 ```
 

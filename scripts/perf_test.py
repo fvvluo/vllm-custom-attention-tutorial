@@ -35,11 +35,14 @@ perf_test.py —— vLLM OpenAI 兼容服务的长上下文性能测试。
 依赖：openai 客户端；（可选）transformers 用于精确控长。
 """
 import argparse
+import os
 import statistics
 import sys
 import time
 
-MODEL_PATH = "/dockerdata/models/Qwen3-32B"
+# 模型目录（用于 tokenizer 精确控长）。这是镜像里的外部模型路径，非本仓库内容；
+# 若你的模型在别处，用环境变量覆盖：MODEL_PATH=/your/path python scripts/perf_test.py ...
+MODEL_PATH = os.environ.get("MODEL_PATH", "/dockerdata/models/Qwen3-32B")
 
 # 一段中性的重复语料，用于把输入撑到目标长度（内容无关紧要，只为占满上下文）。
 _FILLER = (

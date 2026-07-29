@@ -20,7 +20,10 @@ set -euo pipefail
 
 # ---- 可按需修改的配置 -------------------------------------------------------
 VLLM_COMMIT="a49d37c6b"
-VLLM_SRC="${VLLM_SRC:-/dockerdata/landojiang/vllm_src}"
+# 默认把源码克隆到【本仓库的兄弟目录】../vllm_src（源码不纳入本仓库，见 .gitignore）。
+# 无论仓库 clone 到哪里都能自动定位；也可用环境变量 VLLM_SRC 覆盖。
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VLLM_SRC="${VLLM_SRC:-$(cd "${REPO_ROOT}/.." && pwd)/vllm_src}"
 VLLM_REPO="${VLLM_REPO:-https://github.com/vllm-project/vllm.git}"
 # -----------------------------------------------------------------------------
 

@@ -12,8 +12,8 @@ baseline，和一份【朴素 PyTorch 参考实现】逐元素比对，验证其
   - decode ：请求已有 context，本次只喂 1 个 token（query_len == 1）。
 以及两者混合的 batch。
 
-运行：
-  PYTHONPATH=/dockerdata/landojiang/vllm_src python tests/test_paged_attn_correctness.py
+运行（在仓库根目录下）：
+  PYTHONPATH=../vllm_src:. python tests/test_paged_attn_correctness.py
 """
 
 import torch

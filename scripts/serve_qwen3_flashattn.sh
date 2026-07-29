@@ -9,7 +9,7 @@
 # =============================================================================
 set -euo pipefail
 
-VLLM_SRC="${VLLM_SRC:-/dockerdata/landojiang/vllm_src}"
+VLLM_SRC="${VLLM_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/vllm_src}"
 MODEL="${MODEL:-/dockerdata/models/Qwen3-32B}"
 SERVED_NAME="${SERVED_NAME:-qwen3-32b}"
 PORT="${PORT:-8000}"
