@@ -8,7 +8,7 @@
 
 > 面向对象：拿到同款镜像的同学，照着本 README 从零复现。所有命令都是自包含的（绝对路径 + 环境变量 + 预期输出）。
 
-> **📊 评分怎么算（先看这个）**：接入你自己的 attention kernel 后，用**统一分数** `E2E = TTFT + 1000 × TPOT`（生成 1000 token 的端到端秒数，**越低越好**）来衡量。本教程 flash_attn 的 **baseline = `147s`**（单张 H20，~95k 输入实测），你的**加速比 = `147s / 你的 E2E 用时`**。起好服务后跑一条 `scripts/perf_test.py` 即可直接读出分数，详见 [**Part 4.2「评测你自己 kernel 的 E2E 分数」**](#42-评测你自己-kernel-的-e2e-分数一条命令)。
+> **📊 评分怎么算（先看这个）**：接入你自己的 attention kernel 后，用**统一分数** `E2E = TTFT + 1000 × TPOT`（生成 1000 token 的端到端秒数，**越低越好**）来衡量。本教程 flash_attn 的 **baseline = `147s`**（单张 H20，~95k 输入实测），你的**加速比 = `147s / 你的 E2E 用时`**。起好服务后跑一条 `scripts/perf_test.py` 即可直接读出分数，详见 [**Part 4.2「评测你自己 kernel 的 E2E 分数」**](#42-评测你自己-kernel-的-e2e-分数)。
 
 > **📮 最终需要提交两项（每项都要「命令 + 该命令的输出截图」，缺一不可）**：
 >
@@ -18,7 +18,7 @@
 >    ```
 >    截图须包含**你敲的这条命令**和输出里的 **`ALL PASS`**。
 >
-> 2. **性能**（详见 [Part 4.2](#42-评测你自己-kernel-的-e2e-分数一条命令)，须用默认参数）
+> 2. **性能**（详见 [Part 4.2](#42-评测你自己-kernel-的-e2e-分数)，须用默认参数）
 >    ```bash
 >    python scripts/perf_test.py --input-len 100000 --output-len 64
 >    ```
@@ -655,16 +655,29 @@ E2E 评分        : 146.981 s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到�
 > 补充：单张 H20 上 ~95k token 的真实 prefill（无缓存）就是上面的 TTFT ~111s、decode ~28 tok/s。
 > 若加 `--allow-prefix-cache` 复跑，第 2 次起 TTFT 会降到 **~0.2s**（命中前缀缓存，跳过 prefill）。
 
-### 4.2 评测你自己 kernel 的 E2E 分数（一条命令）
+### 4.2 评测你自己 kernel 的 E2E 分数
 
-换上自己的 attention kernel 后，最省事的评测方式：**起好服务，跑一条 `perf_test.py`，直接读最后一行的 `e2e_score_s`**。
+> ⚠️ **测你自己的 kernel，必须起 CUSTOM 后端服务**——因为你改的 `triton_attention.py` 只有在 `--attention-backend CUSTOM` 时才会被加载。**连 flash_attn 服务测出来的是 flash_attn，不是你的 kernel**（4.1 的 flash_attn 只用来产出 baseline `147s`）。
+
+**第一步：用 CUSTOM 后端 + YaRN 起服务**（和 4.1 的 flash_attn 参数完全对齐，只是后端换成 CUSTOM，这样两者可比）：
 
 ```bash
-# 服务端起在某个端口后（flash_attn 或你的 CUSTOM 后端都行）：
+cd <你的仓库路径>   # 你 clone 本仓库的位置
+HF_OVERRIDES='{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":40960},"max_position_embeddings":163840}' \
+MAX_LEN=102400 GPU_MEM_UTIL=0.94 GPU=4 PORT=8004 \
+bash scripts/serve_qwen3_custom.sh
+```
+
+> 就绪日志出现 `Using AttentionBackendEnum.CUSTOM backend.` 即说明加载的是你的 kernel。
+
+**第二步：在另一个终端跑 perf_test（默认参数，连你的 CUSTOM 服务端口）**：
+
+```bash
+cd <你的仓库路径>
 python scripts/perf_test.py --port 8004 --input-len 100000 --output-len 64
 ```
 
-脚本会**自动输出** E2E 分数**和加速比**（下面是 flash_attn baseline 自己的值，所以加速比≈1.0001x）：
+脚本会**自动输出** E2E 分数**和加速比**（下面示例是 flash_attn baseline 自己的值，所以加速比≈1.0001x；你的高效 kernel 应当 `<147s`、加速比 `>1`）：
 
 ```
 TTFT (中位数)   : 111.411 s
@@ -693,9 +706,11 @@ E2E(s)    = TTFT + 1000 × TPOT            # 例：111.411 + 1000 × 0.03557 ≈
 > 提交成绩时请连同脚本最后一行 `[perf] SUMMARY ...`（含 `e2e_score_s / baseline_e2e_s / speedup`）
 > 与 **GPU 型号**一起给出；不同卡型之间也不可直接比（baseline 是单张 H20）。
 
-### 4.3 CUSTOM 后端：只在小长度上对比（朴素 kernel 跑不动 100k）
+### 4.3 教学示例 kernel：只在小长度上对比（朴素实现跑不动 100k）
 
-**为什么 CUSTOM 不跑 100k**：Part 2 的教学 kernel 是 `grid=(num_tokens × num_heads)` 的朴素
+> 注意区分：这里说"跑不动 100k"的是 **Part 2 自带的那个朴素教学 kernel**，**不是** CUSTOM 后端本身、也不是你换上的高效 kernel。**你自己的高效 kernel 应当按 [4.2](#42-评测你自己-kernel-的-e2e-分数) 用 CUSTOM 后端 + YaRN 正常跑 100k 并和 baseline 比。** 本节只是拿朴素示例在小长度上直观感受"为什么需要高效 kernel"。
+
+**为什么教学示例 kernel 不跑 100k**：Part 2 的教学 kernel 是 `grid=(num_tokens × num_heads)` 的朴素
 实现——每个 (token, head) 一个 Triton program，program 内用一层 `for` **串行**扫过整条 KV
 序列；再加上服务用 `--enforce-eager`（不抓 CUDA graph）。100k prefill 意味着
 `100000 × 64 ≈ 640 万`个 program，每个还要串行读多达 100k 个 KV 位置——实测**极慢、不可实用化**。
