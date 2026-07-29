@@ -413,17 +413,25 @@ tau=1==dense 逐位无损（`_test_sparse_rect.py`/`test_wzc_chunked.py`：ctx=0
 - **TTFT 793.7 → 134.7s（5.9× 更快，已在 flash 111.4s 的 1.2× 内）；E2E 1055 → 395s（2.7× 更好）。**
 - `[wzc-stats] fallback_tok=0`（全部 6.85M token 走 wzc kernel，torch 回退彻底消失）。
 - **剩余瓶颈完全转移到 TPOT=260ms**（decode ~3.8 tok/s）——E2E 里 1000×TPOT=260s ≫ TTFT 135s。
-  这不是 prefill/attention 问题，是 **decode 路径在 100k context 下的适配器开销**（疑似 block_size≠128
-  时每步 gather+repack 95k 历史，或 piecewise 下 decode 仍有大量非图开销）。→ 下一步诊断 TPOT。
+  这不是 prefill/attention 问题。→ 下一步诊断 TPOT。
 
-**TPOT 根因 + 修复（2026-07-29）**：根因证实——vLLM 默认 `block_size=16`，而适配器 decode 的
-零拷贝路径要求 `block_size==128`；否则走 `_decode_one` 慢路径，**每 token gather+repack 整段 ~95k
-历史进 128-page pool**（O(context) 拷贝）→ TPOT 260ms。**修复**：`CustomTritonBackend` 加
-`get_supported_kernel_block_sizes`，在 `WZC_SPARSE_BACKEND=1` 时返回 `[128]`，vLLM
-`get_preferred_block_size` 遂选 128（默认 16 不被 128 整除→取 min=128），KV cache 物理页布局直接
-等于 kernel 的 128-page pool → decode 走 `_decode_one_zerocopy`（零拷贝）。已代码验证（wzc on:
-16→128；wzc off: 保持 16，教学默认路径不受影响）。**100k 重测待 GPU 空闲**（预期 TPOT 从 260ms
-回落到 A1 量级 ~40ms → E2E 从 395s 进一步降到 ~135+40=~175s 级别）。
+**TPOT 诊断结论（2026-07-29，修正之前的错误假设）**：
+- 曾假设 TPOT=260ms 是 decode 慢路径（block_size≠128 → 每步 gather+repack 95k 历史）。**实测证伪。**
+- 先试 `--block-size 128`：**触发崩溃**——vLLM 的 KV cache 把 K|V 打包在最后一维
+  `(num_blocks, kv_heads, block_size, 2*hs)`，`key_cache=split(...)[0]` 半切片的 slot 维 stride 是
+  `2*hs`（非 `hs`），非连续；零拷贝路径传给 kernel 的 `_kv_to_cute`（`mark_compact_shape_dynamic`）
+  报 `stride_order not consistent`。已修复：零拷贝守卫加 `key_cache.is_contiguous()`，否则回退 `_decode_one`。
+- `--block-size 128` 修复崩溃后**重测 E2E：TTFT 134.4s / TPOT 261.4ms / E2E 395.7s —— 与 block_size 无关，
+  完全没变。**
+- **`bench_wzc_decode_adapter.py` 诊断（seq=95653）一锤定音**：(A) raw kernel **120µs** / (B) 完整适配器调用
+  **218µs** / (C) host 开销 **98µs** —— **attention 只占单 token 预算（263ms）的 0.08%**。
+  → **decode 的 261ms 绝大部分是 32B 模型其余部分的开销，不是 attention/gather。** block_size 改不动它。
+- **真凶假设（待验证）**：piecewise 编译的 `compile_ranges_endpoints=[8192]`——decode 在 95k（YaRN）
+  上下文下超出编译 range，可能每步走 eager/重编译，piecewise graph 没覆盖到长上下文 decode。
+  这属 vLLM 编译配置层，不是 attention kernel 层。**需进一步查 piecewise range 配置或换 FULL cudagraph（阶段 A2）。**
+
+> **给自己的教训**：优化前先诊断（本项目方法论）。这次先信了"gather 慢"的直觉去改 block_size，
+> 结果 attention 只占 0.08%。`bench_wzc_decode_adapter.py` 早就该先跑。
 
 
 - **动作（按依赖排序）**：
