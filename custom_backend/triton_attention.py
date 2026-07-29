@@ -17,8 +17,8 @@ import triton
 import triton.language as tl
 
 # ---- StreamingLLM 超参：每个 query 只看 sink(前 _SINK 个) + 最近 _WINDOW 个 KV ----
-_SINK = 4
-_WINDOW = 1024
+_SINK = 64
+_WINDOW = 320
 
 # ---- 分块常量 ----
 _BLOCK_M = 64          # prefill: 每个 program 处理的 query 数
