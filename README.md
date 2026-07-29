@@ -233,7 +233,7 @@ custom_backend/
 └── plugin.py                   # vllm.general_plugins 入口：把类注册到 CUSTOM 后端（不用改）
 ```
 
-> **接入你自己的算子，通常只改 `triton_attention.py` 一个文件**（详见 [2.5](#25-如何替换成你自己的-kernel飞速接入请务必看清)）。
+> **接入你自己的算子，通常只改 `triton_attention.py` 一个文件**（半天冲刺照做版见 [2.5](#25-把你已有的-kernel-接进来半天冲刺版--照着做)）。
 
 vLLM v1 的 attention backend 由“三件套”组成，都在 `custom_triton_backend.py` 里：
 
@@ -323,29 +323,98 @@ PYTHONPATH=../vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32
 
 > **为什么要校验“答案正确”而不只是“非空”？** attention backend 即使把 KV cache 写错了位置，也能返回**非空但错误**的文本（一堆看似通顺、实则乱码的字）。只有用一道**答案已知**的题去校验，才能真正确认后端计算正确。这也是本教程在实现过程中踩过的坑：KV cache 有 **NHD/HND** 两种物理布局，写和读必须用**同一套步长(stride)寻址**才对得上（见 `custom_triton_backend.py` 里 `forward()` 的中文注释）。
 
-### 2.5 如何替换成你自己的 kernel（飞速接入，请务必看清）
+### 2.5 把你已有的 kernel 接进来（半天冲刺版 · 照着做）
 
-**一句话：你几乎只需要动 `custom_backend/triton_attention.py` 这一个文件的内部实现，其余文件都不用碰。**
+> 场景：你**手上已经有一个写好的 attention kernel**，现在要在最短时间内接进 vLLM 跑通。
+> **你要做的只有一件事**：打开 `custom_backend/triton_attention.py`，把 `paged_attention_triton(...)`
+> 的**函数体**换成"整理输入 → 调你的 kernel → 把结果写进 `output`"。**函数名和参数列表一个字都别改**，
+> 其它文件全部不用碰。
 
-⚠️ **关键澄清（别理解反了）**：`paged_attention_triton(...)` 是那个**必须保持不变的对外函数（launcher/入口）**，真正做 attention 计算、你要替换/优化的是这个文件里**它调用的 kernel**（示例中的 `_paged_attn_kernel`）。也就是说——**函数名和签名要保住，函数体和内部 kernel 随便你重写。**
+#### 第 1 步：认清这个函数（唯一的接入点）
 
-#### ✅ 你可以自由修改（你的地盘）
-- **`custom_backend/triton_attention.py` 文件内部的一切实现**：重写 `_paged_attn_kernel`、新增任意 helper / 多个 kernel / 换成 CUDA / cutlass / flash 风格分块并行等，随你发挥。
+`paged_attention_triton(...)` 就是 vLLM 每次算 attention 时会调用的入口。vLLM 会把这些**已经准备好的张量**传给你（形状/含义如下），你只要用它们算出 attention、写进 `output` 即可：
 
-#### 🔒 你必须保持不变（否则接不进 vLLM）
-- **对外函数 `paged_attention_triton` 的名称 + 参数签名 + 语义**（见下方 3.1 接口约定）。
-  原因：`custom_backend/__init__.py` 与 `custom_triton_backend.py` 都按这个名字 import，`CustomTritonImpl.forward()` 按**关键字参数**调用它（`custom_triton_backend.py:242`）。
-- 语义：**causal + GQA + 分页 KV 寻址 + `output` 原地写入**（详见 3.1）。
+```python
+def paged_attention_triton(
+    query,           # [num_tokens, num_heads, head_size]  本次要算的 query（prefill+decode 已拼在一起）
+    key_cache,       # [num_blocks, num_kv_heads, block_size, head_size]  分页 K cache（当前 K 已写好）
+    value_cache,     # [num_blocks, num_kv_heads, block_size, head_size]  分页 V cache（当前 V 已写好）
+    output,          # [num_tokens, num_heads, head_size]  ★结果原地写进这里★
+    query_start_loc, # [num_seqs+1] int32  第 i 条请求的 query 落在 query[start_i : start_{i+1}]
+    seq_lens,        # [num_seqs]   int32  第 i 条请求的总长度（历史 context + 本次 query）
+    token_seq_idx,   # [num_tokens] int32  每个 token 属于第几条请求（已替你算好）
+    block_table,     # [num_seqs, max_num_blocks] int32  逻辑块号 -> 物理块号
+    scale,           # float  softmax 缩放系数 1/sqrt(head_size)
+) -> torch.Tensor:   # 返回 output
+    ...
+```
 
-#### ❌ 通常不需要改（除非你要改接口本身）
-- `custom_triton_backend.py`（三件套 Backend/Builder/Impl）、`plugin.py`（注册入口）、`__init__.py`、`pyproject.toml`——**保持原样即可**。
+要点：
+- **KV cache 已经写好了**（写 cache 由上游 `CustomTritonImpl.forward` 完成，不用你管），你只负责**读 cache 算 attention**。
+- 结果必须**原地写进 `output`**（形状 `[num_tokens, num_heads, head_size]`），最后 `return output`。
+- 必须是 **causal**（token 只能看自己及之前的位置）+ **GQA**（`num_heads` 是 `num_kv_heads` 的整数倍，多个 Q 头共享一个 KV 头）。
+- 第 `req` 条请求第 `j` 个位置的 KV 在：`pb = block_table[req, j // block_size]`，槽位 `j % block_size`，即 `key_cache[pb, kv_head, j % block_size, :]`。
 
-#### 📄 关于文件名
-- **建议保持 `triton_attention.py` 文件名不变**（最省事）。若一定要改名，必须同步改 **2 处 import**：`custom_backend/__init__.py` 和 `custom_backend/custom_triton_backend.py` 顶部的 `from .triton_attention import paged_attention_triton`。
+#### 第 2 步：套用这个适配器模板
 
-> **进阶（可选）**：如果你的 kernel 签名和示例不同、不想套用 `paged_attention_triton` 这个签名，也可以直接改 `CustomTritonImpl.forward()`（`custom_triton_backend.py`）里那一段调用，改成调你自己的函数。但对绝大多数人，**保持签名、只重写 `triton_attention.py` 内部**是最快的接入方式。
+大多数现成 kernel 的输入格式和上面不完全一样（比如你的 kernel 要连续的 `[seq, heads, dim]`、或要 cu_seqlens、或要非分页的 K/V）。**接入的本质 = 在这个函数里做一次"格式转换"**。把下面的骨架抄进 `triton_attention.py`，替换原来的函数体：
 
-完整接口约定（签名 + 语义 + 分页寻址规则）见下方 **Part 3.1**。
+```python
+def paged_attention_triton(query, key_cache, value_cache, output,
+                           query_start_loc, seq_lens, token_seq_idx,
+                           block_table, scale):
+    # ==== 在这里把 vLLM 的分页输入，整理成你的 kernel 需要的格式 ====
+    # 例：逐条请求，用 block_table 把分页 KV 还原成连续 [seq_len, num_kv_heads, head_size]
+    num_seqs = seq_lens.shape[0]
+    block_size = key_cache.shape[2]
+    for i in range(num_seqs):
+        s, e = int(query_start_loc[i]), int(query_start_loc[i + 1])   # 本请求 query 区间
+        q_i = query[s:e]                                              # [q_len, num_heads, hs]
+        L = int(seq_lens[i])                                          # 该请求总长度
+        # 用 block_table 收集该请求的前 L 个 KV（gather 出连续 K/V）
+        blocks = block_table[i]
+        k_i = torch.cat([key_cache[blocks[j // block_size], :, j % block_size, :].unsqueeze(0)
+                         for j in range(L)], dim=0)                   # [L, num_kv_heads, hs]
+        v_i = torch.cat([value_cache[blocks[j // block_size], :, j % block_size, :].unsqueeze(0)
+                         for j in range(L)], dim=0)
+
+        # ==== 调用你自己的 kernel（causal、GQA、scale）====
+        out_i = YOUR_KERNEL(q_i, k_i, v_i, scale=scale, causal=True)  # 返回 [q_len, num_heads, hs]
+
+        # ==== 把结果写回 output（原地）====
+        output[s:e] = out_i
+    return output
+```
+
+> 上面的 `for` 循环 + `torch.cat` 只是**最省事的正确写法**（先跑通、先过正确性测试）。等 2.5 跑通、Part 3 正确性 PASS 后，再回来把它换成你 kernel 的高效分页/批量实现来冲性能（Part 4）。
+> 如果你的 kernel **本身就支持分页 KV cache**（直接吃 `block_table`），那更简单：直接把 `key_cache/value_cache/block_table/query_start_loc/seq_lens` 传给它，连 gather 都省了。
+
+#### 第 3 步：跑通三连（每步都有预期输出，照着比对）
+
+```bash
+cd <你的仓库路径>
+
+# ① 先离线验正确性（最快，不用起 32B 服务）——必须 ALL PASS
+PYTHONPATH=../vllm_src:. python tests/test_paged_attn_correctness.py
+
+# ② 起服务（第一个终端）
+GPU=0 PORT=8000 bash scripts/serve_qwen3_custom.sh
+
+# ③ 冒烟测试（第二个终端）——必须 PASS 且答案含 42
+PYTHONPATH=../vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32b
+```
+
+三步全绿，你的 kernel 就接通了。之后按 Part 4 测 E2E 分数、和 baseline `147s` 比加速比。
+
+#### 🔒 铁律（省得踩坑返工）
+- **不要改** `paged_attention_triton` 的**函数名和参数列表**（`__init__.py` / `custom_triton_backend.py` 按名字和关键字调它）。函数体随便写。
+- **不要动** `custom_triton_backend.py` / `plugin.py` / `__init__.py` / `pyproject.toml`。
+- 文件名**保持 `triton_attention.py`**（改名要同步改 2 处 import，没必要）。
+- 结果一定写进 `output` 并 `return output`；别新建张量返回却不写 `output`。
+
+> **进阶（一般用不到）**：若你的 kernel 签名实在没法套进这个函数，也可以改 `CustomTritonImpl.forward()`（`custom_triton_backend.py`）里调用它的那几行。但对半天冲刺来说，**只改 `triton_attention.py` 函数体**是最快路径。
+
+完整接口约定（签名 + 语义 + 分页寻址规则）另见下方 **Part 3.1**。
 
 ---
 
