@@ -227,11 +227,13 @@ pass@1 = 145/164 = 0.8841  (88.41%)
 
 ```
 custom_backend/
-├── __init__.py                 # 导出后端类与 paged_attention_triton
-├── triton_attention.py         # 【你要替换的部分】简易 Triton 分页注意力 kernel
-├── custom_triton_backend.py    # v1 backend 三件套：Backend / MetadataBuilder / Impl
-└── plugin.py                   # vllm.general_plugins 入口：把类注册到 CUSTOM 后端
+├── __init__.py                 # 导出后端类与 paged_attention_triton（不用改）
+├── triton_attention.py         # 【★你唯一要改的文件★】简易 Triton 分页注意力 kernel
+├── custom_triton_backend.py    # v1 backend 三件套：Backend / MetadataBuilder / Impl（不用改）
+└── plugin.py                   # vllm.general_plugins 入口：把类注册到 CUSTOM 后端（不用改）
 ```
+
+> **接入你自己的算子，通常只改 `triton_attention.py` 一个文件**（详见 [2.5](#25-如何替换成你自己的-kernel飞速接入请务必看清)）。
 
 vLLM v1 的 attention backend 由“三件套”组成，都在 `custom_triton_backend.py` 里：
 
@@ -321,9 +323,29 @@ PYTHONPATH=../vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32
 
 > **为什么要校验“答案正确”而不只是“非空”？** attention backend 即使把 KV cache 写错了位置，也能返回**非空但错误**的文本（一堆看似通顺、实则乱码的字）。只有用一道**答案已知**的题去校验，才能真正确认后端计算正确。这也是本教程在实现过程中踩过的坑：KV cache 有 **NHD/HND** 两种物理布局，写和读必须用**同一套步长(stride)寻址**才对得上（见 `custom_triton_backend.py` 里 `forward()` 的中文注释）。
 
-### 2.5 如何替换成你自己的 kernel
+### 2.5 如何替换成你自己的 kernel（飞速接入，请务必看清）
 
-你**只需要**改 `custom_backend/triton_attention.py` 里的 `paged_attention_triton(...)`（保持函数签名与语义不变），或在 `CustomTritonImpl.forward` 里改成调用你自己的函数。接口约定见 Part 3。
+**一句话：你几乎只需要动 `custom_backend/triton_attention.py` 这一个文件的内部实现，其余文件都不用碰。**
+
+⚠️ **关键澄清（别理解反了）**：`paged_attention_triton(...)` 是那个**必须保持不变的对外函数（launcher/入口）**，真正做 attention 计算、你要替换/优化的是这个文件里**它调用的 kernel**（示例中的 `_paged_attn_kernel`）。也就是说——**函数名和签名要保住，函数体和内部 kernel 随便你重写。**
+
+#### ✅ 你可以自由修改（你的地盘）
+- **`custom_backend/triton_attention.py` 文件内部的一切实现**：重写 `_paged_attn_kernel`、新增任意 helper / 多个 kernel / 换成 CUDA / cutlass / flash 风格分块并行等，随你发挥。
+
+#### 🔒 你必须保持不变（否则接不进 vLLM）
+- **对外函数 `paged_attention_triton` 的名称 + 参数签名 + 语义**（见下方 3.1 接口约定）。
+  原因：`custom_backend/__init__.py` 与 `custom_triton_backend.py` 都按这个名字 import，`CustomTritonImpl.forward()` 按**关键字参数**调用它（`custom_triton_backend.py:242`）。
+- 语义：**causal + GQA + 分页 KV 寻址 + `output` 原地写入**（详见 3.1）。
+
+#### ❌ 通常不需要改（除非你要改接口本身）
+- `custom_triton_backend.py`（三件套 Backend/Builder/Impl）、`plugin.py`（注册入口）、`__init__.py`、`pyproject.toml`——**保持原样即可**。
+
+#### 📄 关于文件名
+- **建议保持 `triton_attention.py` 文件名不变**（最省事）。若一定要改名，必须同步改 **2 处 import**：`custom_backend/__init__.py` 和 `custom_backend/custom_triton_backend.py` 顶部的 `from .triton_attention import paged_attention_triton`。
+
+> **进阶（可选）**：如果你的 kernel 签名和示例不同、不想套用 `paged_attention_triton` 这个签名，也可以直接改 `CustomTritonImpl.forward()`（`custom_triton_backend.py`）里那一段调用，改成调你自己的函数。但对绝大多数人，**保持签名、只重写 `triton_attention.py` 内部**是最快的接入方式。
+
+完整接口约定（签名 + 语义 + 分页寻址规则）见下方 **Part 3.1**。
 
 ---
 
