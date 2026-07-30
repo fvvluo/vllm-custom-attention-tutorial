@@ -17,9 +17,18 @@ PORT="${PORT:-8000}"
 GPU="${GPU:-0}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
 MAX_LEN="${MAX_LEN:-8192}"
+# 可选：HF config 覆盖（JSON）。100k 等长上下文测试时开 YaRN 把 rope 扩到 128k（与
+# serve_qwen3_flashattn.sh 一致的接口）。不设则为空、不影响短上下文默认行为。
+#   HF_OVERRIDES='{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":40960},"max_position_embeddings":163840}'
+HF_OVERRIDES="${HF_OVERRIDES:-}"
 
 export CUDA_VISIBLE_DEVICES="${GPU}"
 export PYTHONPATH="${VLLM_SRC}:${PYTHONPATH:-}"
+
+EXTRA_ARGS=()
+if [[ -n "${HF_OVERRIDES}" ]]; then
+    EXTRA_ARGS+=(--hf-overrides "${HF_OVERRIDES}")
+fi
 # CUSTOM 后端通过 pip 安装的 general_plugin 自动注册（见 pyproject.toml）。
 # 教学示例后端不参与 CUDA graph，用 --enforce-eager 关闭 torch.compile / graph 捕获，
 # 路径最简单、最好调试。
@@ -37,4 +46,5 @@ exec python -m vllm.entrypoints.openai.api_server \
     --max-model-len "${MAX_LEN}" \
     --enforce-eager \
     --no-async-scheduling \
-    --attention-backend CUSTOM
+    --attention-backend CUSTOM \
+    "${EXTRA_ARGS[@]}"

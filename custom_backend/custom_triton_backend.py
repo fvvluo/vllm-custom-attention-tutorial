@@ -45,6 +45,15 @@ from vllm.platforms import current_platform
 
 from .triton_attention import paged_attention_triton
 
+# 稀疏 decode 开关（env）：CUSTOM_SPARSE=1 启用；CUSTOM_SPARSITY 读块比例；
+# CUSTOM_SPARSE_BLOCK 稀疏块大小（须为 block_size=16 的整数倍，默认 64=4页）；
+# CUSTOM_SPARSE_MIN_LEN 短序列阈值（低于则回退 dense，稀疏对短序列不划算）。
+import os as _os  # noqa: E402
+_SPARSE_ENABLED = _os.environ.get("CUSTOM_SPARSE", "0") == "1"
+_SPARSITY = float(_os.environ.get("CUSTOM_SPARSITY", "0.25"))
+_SPARSE_BLOCK = int(_os.environ.get("CUSTOM_SPARSE_BLOCK", "64"))
+_SPARSE_MIN_LEN = int(_os.environ.get("CUSTOM_SPARSE_MIN_LEN", "8192"))
+
 
 # ============================================================================
 # 1. 本后端使用的 attention 元数据
@@ -274,9 +283,20 @@ class CustomTritonImpl(AttentionImpl):
         )
 
         # ---- 2. 调用（学生可替换的）Triton 分页注意力 ----
-        # fp8 KV cache 时把 per-tensor descale（k_scale/v_scale 标量）传给 kernel，
-        # 让它把读到的 fp8 K/V 乘回真实量级；auto(bf16) 时 descale=None。
         out_view = output[:num_actual_tokens].view(-1, self.num_heads, hs)
+
+        # ---- 2a. 稀疏 decode 分支（env CUSTOM_SPARSE=1）----
+        # 只在纯 decode（q_len=1）+ bf16 KV + 序列足够长时启用；prefill / fp8 / 短序列走原路径。
+        # 稀疏块=64=4×block_size(16)；Quest 上界选 top-k，只读 sparsity 比例的块。
+        # 注：本阶段每步现场建 k_min/k_max 摘要（读一次全 KV）——正确性完备但摘要构建本身有
+        # 带宽成本；稳态应缓存摘要 + 增量更新（见 sparse_paged / build_paged_block_summary 的
+        # update_block_summary_append 范式）。故本分支主要用于**正确性/端到端质量验证**。
+        if (_SPARSE_ENABLED and not attn_metadata.is_prefill and not is_fp8_kv
+                and self._sparse_ok(attn_metadata)):
+            if self._sparse_decode(out_view, query, key_cache, value_cache,
+                                    attn_metadata, num_actual_tokens):
+                return output  # 稀疏路径成功处理了全部 token
+
         paged_attention_triton(
             query=query[:num_actual_tokens],
             key_cache=key_cache,
@@ -293,3 +313,38 @@ class CustomTritonImpl(AttentionImpl):
             is_prefill=attn_metadata.is_prefill,
         )
         return output
+
+    # ---- 稀疏 decode 辅助 ----
+    def _sparse_ok(self, md) -> bool:
+        # 纯 decode 批：num_actual_tokens == num_seqs（每序列 1 token）。
+        # 序列需足够长（> 稀疏块 × 一定倍数）稀疏才划算。
+        try:
+            n = md.num_actual_tokens
+            return md.seq_lens.shape[0] == n and n >= 1
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _sparse_decode(self, out_view, query, key_cache, value_cache, md,
+                       num_actual_tokens) -> bool:
+        """对纯 decode 批逐序列跑稀疏分页 decode。成功返回 True。"""
+        from .sparse_paged import sparse_paged_decode
+        bt = md.block_table            # (num_seqs, max_blocks) int32
+        seq_lens = md.seq_lens         # (num_seqs,)
+        hs = self.head_size
+        min_len = _SPARSE_MIN_LEN
+        try:
+            for i in range(num_actual_tokens):
+                slen = int(seq_lens[i].item())
+                if slen < min_len:
+                    return False       # 有短序列 → 整批回退 dense（保持简单）
+            for i in range(num_actual_tokens):
+                slen = int(seq_lens[i].item())
+                q_i = query[i]                          # (num_heads, hs)
+                o = sparse_paged_decode(
+                    q_i.view(1, self.num_heads, hs), key_cache, value_cache,
+                    bt[i], slen, sm_scale=self.scale,
+                    sparsity=_SPARSITY, sparse_block=_SPARSE_BLOCK)
+                out_view[i] = o.view(self.num_heads, hs)
+            return True
+        except Exception:  # noqa: BLE001  稀疏失败则回退 dense（不影响正确性）
+            return False
