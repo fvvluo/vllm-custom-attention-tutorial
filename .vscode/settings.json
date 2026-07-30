@@ -1,0 +1,9 @@
+{
+    "editor.fontSize": 16,
+    "editor.stickyScroll.enabled": false,
+    "terminal.integrated.fontSize": 12,
+    "terminal.integrated.stickyScroll.enabled": false,
+    "github.copilot.enable": {
+        "*": false
+    }
+}
