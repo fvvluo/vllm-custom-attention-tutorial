@@ -8,6 +8,10 @@ perf_test.py —— vLLM OpenAI 兼容服务的长上下文性能测试。
   用流式(stream=True)接口测两个关键指标：
     - TTFT (Time To First Token，首 token 延迟)：主要反映 **prefill**（处理长输入）耗时；
     - decode 吞吐 (tokens/s)：首 token 之后的**逐 token 生成**速度。
+  并据此换算出：
+    - TPOT (Time Per Output Token)：decode 每个 token 的耗时，= 1 / decode 吞吐；
+    - E2E 评分 = TTFT + 1000 × TPOT：把 prefill 与 decode 汇总成"生成 1000 token
+      的端到端秒数"作为可比较的分数（越低越好）——这就是给不同 kernel 打分用的数字。
   另外给出端到端总时延、实际生成 token 数。
 
 为什么用 100k 输入：
@@ -31,11 +35,12 @@ perf_test.py —— vLLM OpenAI 兼容服务的长上下文性能测试。
 依赖：openai 客户端；（可选）transformers 用于精确控长。
 """
 import argparse
+import os
 import statistics
 import sys
 import time
 
-MODEL_PATH = "/dockerdata/models/Qwen3-32B"
+MODEL_PATH = os.environ.get("MODEL_PATH", "/models/Qwen3-32B")
 
 # 一段中性的重复语料，用于把输入撑到目标长度（内容无关紧要，只为占满上下文）。
 _FILLER = (
@@ -193,16 +198,26 @@ def main() -> int:
     med_total = statistics.median(totals)
     med_out = int(statistics.median(nouts))
 
+    # TPOT (Time Per Output Token)：decode 阶段平均每个 token 的耗时，是 decode 吞吐的倒数。
+    tpot_s = (1.0 / med_tps) if med_tps > 0 else float("nan")
+    # E2E 评分：以"生成 1000 个 token 的端到端时间"作为统一分数，越低越好。
+    #   score = TTFT + 1000 × TPOT
+    # 这样把 prefill(TTFT) 与 decode(TPOT) 用一个可比较的秒数汇总，方便给不同 kernel 打分。
+    e2e_score_s = med_ttft + 1000.0 * tpot_s if med_tps > 0 else float("nan")
+
     print("=" * 64)
     print(f"输入长度        : ~{actual_len} tokens ({tag})")
     print(f"生成长度        : {med_out} tokens (上限 {args.output_len})")
-    print(f"TTFT (中位数)   : {med_ttft:.3f} s   <- 主要是 prefill 长输入的耗时")
+    print(f"TTFT (中位数)   : {med_ttft:.3f} s   <- prefill 长输入的耗时")
+    print(f"TPOT            : {tpot_s * 1000:.2f} ms/token   <- decode 每 token 耗时 (=1/吞吐)")
     print(f"decode 吞吐     : {med_tps:.1f} tokens/s   <- 首 token 之后的生成速度")
-    print(f"端到端总时延    : {med_total:.3f} s")
+    print(f"端到端总时延    : {med_total:.3f} s   <- 本次实际请求 (~{med_out} tok) 的总耗时")
+    print(f"E2E 评分        : {e2e_score_s:.3f} s   <- TTFT + 1000×TPOT (生成 1000 tok 的端到端时间，越低越好)")
     print("=" * 64)
     # 一行机器可读汇总，便于把两个后端结果对比
     print(f"[perf] SUMMARY input={actual_len} out={med_out} "
-          f"ttft_s={med_ttft:.3f} decode_tps={med_tps:.1f} total_s={med_total:.3f}")
+          f"ttft_s={med_ttft:.3f} tpot_ms={tpot_s * 1000:.2f} decode_tps={med_tps:.1f} "
+          f"total_s={med_total:.3f} e2e_score_s={e2e_score_s:.3f}")
     return 0
 
 
