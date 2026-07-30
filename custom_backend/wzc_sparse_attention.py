@@ -59,9 +59,26 @@ if _ATTN_TEST_DIR not in sys.path:
 #                quality-neutral (HumanEval 90.24% >= flash 88.41%) while giving
 #                the biggest long-context prefill speedup. Lower = faster/riskier.
 _TAU = float(os.environ.get("WZC_SPARSE_TAU", "0.5"))
-_LOCAL = 2
-_SINK = 1
+# Sliding-window knobs (also env-overridable, re-read per call like tau). Setting
+# WZC_SPARSE_TAU=0 turns the block-top-k selector into a PURE sliding window:
+# only the forced sink (first _SINK blocks) + local (last _LOCAL blocks before the
+# diagonal) segments are kept, dropping all mid-context KV. Widen _LOCAL/_SINK to
+# trade quality for coverage.
+_LOCAL = int(os.environ.get("WZC_SPARSE_LOCAL", "2"))
+_SINK = int(os.environ.get("WZC_SPARSE_SINK", "1"))
 _FORCE_DENSE = False  # debug toggle: True -> always torch fallback
+
+# DECODE sliding-window (lossy) knobs. The decode kernel reads the FULL gathered
+# history every step -> O(seq_len) gather+repack, which is the E2E-killer TPOT
+# (244ms @ 95k vs 38ms @ 2k). A sliding window bounds decode attention (and its
+# gather) to a FIXED set of pages: the first _DECODE_SINK pages (attention sinks)
+# + the last _DECODE_WINDOW pages (recent context). This makes per-step cost
+# O(window)=const, collapsing TPOT back to ~flash. Pages are 128 tokens each.
+#   default sink=1 + window=7 -> 1024 tokens attended. On short HumanEval prompts
+#   (<=3 pages) the window covers everything -> lossless. Env-overridable.
+# _DECODE_WINDOW<=0 disables the window (full-history decode, original behavior).
+_DECODE_SINK = int(os.environ.get("WZC_DECODE_SINK", "1"))
+_DECODE_WINDOW = int(os.environ.get("WZC_DECODE_WINDOW", "7"))
 
 _BLOCK = 128  # the wzc prefill kernel tiles KV in BLOCK_N=128 and needs S%128==0
 _STATS = os.environ.get("WZC_SPARSE_STATS", "0") == "1"
@@ -125,6 +142,56 @@ def _gather_kv(key_cache, value_cache, block_table, seq_idx, seq_len):
     K = key_cache[pb][:, :, 0, :] if block_size == 1 else key_cache[pb, :, slot, :]
     V = value_cache[pb][:, :, 0, :] if block_size == 1 else value_cache[pb, :, slot, :]
     return K.contiguous(), V.contiguous()
+
+
+def _gather_kv_window(key_cache, value_cache, block_table, seq_idx, seq_len,
+                      sink, window):
+    """Gather ONLY the sliding-window KV for one decode request: the first
+    `sink` pages (attention sinks) + the last `window` pages (recent context).
+
+    Returns (K, V, eff_len) where K/V are (eff_len, num_kv_heads, head_size)
+    contiguous, and eff_len is the number of gathered tokens. The decode kernel
+    then attends exactly these tokens (a single decode query has no intra-decode
+    causality, so it attends the whole selected set); dropping mid-context pages
+    is the intended lossy sliding window.
+
+    Cost is O((sink+window)*128) per step -- INDEPENDENT of seq_len -- which is
+    what collapses the O(seq_len) per-step gather+repack that dominated TPOT.
+
+    Falls back to gathering everything when the sequence already fits in
+    sink+window pages (short prompts: lossless) or the window is disabled.
+    """
+    block_size = key_cache.shape[2]
+    dev = key_cache.device
+    total_pages = (seq_len + block_size - 1) // block_size
+
+    # Short enough (or window disabled) -> gather the full history (lossless).
+    if window <= 0 or total_pages <= sink + window:
+        K, V = _gather_kv(key_cache, value_cache, block_table, seq_idx, seq_len)
+        return K, V, int(seq_len)
+
+    # Logical page ids to keep: [0, sink) ++ [total_pages-window, total_pages).
+    # These ranges are disjoint here (total_pages > sink+window), so no dedup.
+    last_full = total_pages - 1                       # index of the (partial) last page
+    tail_start = total_pages - window
+    # Token positions covered by the selected pages, in ascending logical order.
+    # Every selected page contributes its full 128 slots EXCEPT the very last
+    # page, which is truncated to seq_len's tail so we never read stale slots.
+    parts = []
+    for p in range(sink):
+        parts.append((p * block_size, (p + 1) * block_size))
+    for p in range(tail_start, total_pages):
+        lo = p * block_size
+        hi = min((p + 1) * block_size, seq_len)       # truncate the partial last page
+        parts.append((lo, hi))
+    pos = torch.cat([torch.arange(lo, hi, device=dev) for (lo, hi) in parts])
+
+    logical_block = pos // block_size
+    slot = pos % block_size
+    pb = block_table[seq_idx, logical_block]
+    K = key_cache[pb][:, :, 0, :] if block_size == 1 else key_cache[pb, :, slot, :]
+    V = value_cache[pb][:, :, 0, :] if block_size == 1 else value_cache[pb, :, slot, :]
+    return K.contiguous(), V.contiguous(), int(pos.numel())
 
 
 def _decode_one(q1, K, V, scale):
@@ -264,9 +331,25 @@ def paged_attention_wzc(
     use_sparse = (not _FORCE_DENSE) and head_size == 128
     if use_sparse and _KERNEL is None:
         _KERNEL = _load_kernel()
-    # Re-read tau per call so it can be changed at runtime (tests set
+    # Re-read tau/window per call so they can be changed at runtime (tests set
     # WZC_SPARSE_TAU per case; a serve run sets it once in the environment).
+    # TEST-ONLY: an optional control file lets a sweep flip configs WITHOUT
+    # restarting the server (each ~3min model reload on a shared box is costly).
+    # File format: "tau local sink" on one line. Absent -> use env/defaults.
+    # Remove this block after the sliding-window sweep experiment.
+    _ctl = os.environ.get("WZC_SWEEP_CTL", "/tmp/wzc_sweep_ctl.txt")
+    if _ctl and os.path.exists(_ctl):
+        try:
+            with open(_ctl) as _f:
+                _t, _l, _s = _f.read().split()
+            os.environ["WZC_SPARSE_TAU"] = _t
+            os.environ["WZC_SPARSE_LOCAL"] = _l
+            os.environ["WZC_SPARSE_SINK"] = _s
+        except Exception:
+            pass
     tau = float(os.environ.get("WZC_SPARSE_TAU", _TAU))
+    local_window = int(os.environ.get("WZC_SPARSE_LOCAL", _LOCAL))
+    sink_blocks = int(os.environ.get("WZC_SPARSE_SINK", _SINK))
 
     for req in range(num_seqs):
         q0, q1 = qsl[req], qsl[req + 1]
@@ -292,6 +375,28 @@ def paged_attention_wzc(
         if decode_ok and block_size == _PAGE and key_cache.is_contiguous():
             output[q0:q1] = _decode_one_zerocopy(
                 q[0], key_cache, value_cache, block_table, req, seq_len, scale
+            ).unsqueeze(0).to(output.dtype)
+            _stat["kernel_reqs"] += 1
+            _stat["kernel_tokens"] += q_len
+            if seq_len > _stat["max_kernel_seq"]:
+                _stat["max_kernel_seq"] = seq_len
+            continue
+
+        # DECODE with a non-128 / K|V-packed vLLM cache (the common CUSTOM case):
+        # zero-copy above was skipped, so we must gather+repack. Gather ONLY the
+        # sliding-window pages (sink + last window) instead of the full history:
+        # this bounds the per-step gather+repack to O(window) and is what pulls
+        # TPOT back from ~244ms (full 95k re-gather every token) to ~flash. The
+        # windowed gather is lossy (drops mid-context KV) but lossless on prompts
+        # that fit in sink+window pages (e.g. HumanEval). Runs BEFORE the shared
+        # full `_gather_kv` below so decode never pays the O(seq_len) gather.
+        if decode_ok:
+            Kw, Vw, _eff = _gather_kv_window(
+                key_cache, value_cache, block_table, req, seq_len,
+                _DECODE_SINK, _DECODE_WINDOW
+            )
+            output[q0:q1] = _decode_one(
+                q[0], Kw, Vw, scale
             ).unsqueeze(0).to(output.dtype)
             _stat["kernel_reqs"] += 1
             _stat["kernel_tokens"] += q_len
@@ -340,7 +445,8 @@ def paged_attention_wzc(
                 Kk = torch.nn.functional.pad(Kk, (0, 0, 0, pad))
                 Vk = torch.nn.functional.pad(Vk, (0, 0, 0, pad))
             Ok = _KERNEL.run(Qk, Kk, Vk, causal=True, sm_scale=scale,
-                             tau=tau, local_window=_LOCAL, sink_blocks=_SINK)
+                             tau=tau, local_window=local_window,
+                             sink_blocks=sink_blocks)
             # (1,H,S,D) -> (q_len,H,D), dropping padded rows.
             output[q0:q1] = Ok[0, :, :q_len].transpose(0, 1).to(output.dtype)
             _stat["kernel_reqs"] += 1
@@ -370,7 +476,8 @@ def paged_attention_wzc(
                 Kk = torch.nn.functional.pad(Kk, (0, 0, 0, padkv))
                 Vk = torch.nn.functional.pad(Vk, (0, 0, 0, padkv))
             Ok = _KERNEL_RECT.run(Qk, Kk, Vk, causal=True, sm_scale=scale,
-                                  tau=tau, local_window=_LOCAL, sink_blocks=_SINK)
+                                  tau=tau, local_window=local_window,
+                                  sink_blocks=sink_blocks)
             output[q0:q1] = Ok[0, :, :q_len].transpose(0, 1).to(output.dtype)
             _stat["kernel_reqs"] += 1
             _stat["kernel_tokens"] += q_len

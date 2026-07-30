@@ -56,7 +56,8 @@ HF_OVERRIDES="${HF_OVERRIDES:-}"
 export CUDA_VISIBLE_DEVICES="${GPU}"
 export PYTHONPATH="${VLLM_SRC}:${PYTHONPATH:-}"
 # 可选：打开路由计数器，确认稀疏 kernel 真触发（日志出现 [wzc-stats] kernel_reqs=...）。
-export WZC_SPARSE_STATS="${WZC_SPARSE_STATS:-1}"
+# 默认关闭（每次 forward 打印一行会刷屏）；调试路由时设 WZC_SPARSE_STATS=1 打开。
+export WZC_SPARSE_STATS="${WZC_SPARSE_STATS:-0}"
 
 EXTRA_ARGS=()
 if [[ -n "${HF_OVERRIDES}" ]]; then

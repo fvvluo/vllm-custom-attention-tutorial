@@ -171,7 +171,7 @@ PYTHONPATH=../vllm_src python scripts/humaneval_generate.py \
 
 # 跑完整 164 题（并发 4 条请求加速）
 PYTHONPATH=../vllm_src python scripts/humaneval_generate.py \
-    --port 8000 --model qwen3-32b --concurrency 4 \
+    --port 8013 --model qwen3-32b --concurrency 4 \
     --output logs/humaneval_samples.jsonl
 ```
 
