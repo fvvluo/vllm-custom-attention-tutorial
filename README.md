@@ -20,23 +20,29 @@
 
 > **📮 最终需要提交两项（每项都要「命令 + 该命令的输出截图」，缺一不可）**：
 >
-> 1. **正确性**（详见 [Part 3](#part-3分页注意力正确性检测)）
+> 1. **正确性：HumanEval pass@1**（详见 [Part 1.4](#14-用-humaneval-评测本服务pass1贪心)）
+>    起好**你自己的 CUSTOM 后端服务**后，跑：
 >    ```bash
->    PYTHONPATH=../vllm_src:. python tests/test_paged_attn_correctness.py
+>    # 生成补全（连你的 CUSTOM 服务端口）
+>    PYTHONPATH=../vllm_src python scripts/humaneval_generate.py \
+>        --port 8004 --model qwen3-32b --concurrency 4 --output logs/humaneval_samples.jsonl
+>    # 沙箱评测得到 pass@1
+>    python scripts/humaneval_evaluate.py --samples logs/humaneval_samples.jsonl \
+>        --timeout 10 --workers 8 --report logs/humaneval_report.jsonl
 >    ```
->    截图须包含**你敲的这条命令**和输出里的 **`ALL PASS`**。
+>    截图须包含**命令**和输出结尾的 `pass@1 = xxx/164 = ...`。**你的 pass@1 应与 flash_attn baseline（`145/164 ≈ 88.41%`）基本持平**（差几题属贪心正常抖动）；若大幅崩塌，说明 kernel 算错了。
 >
-> 2. **性能**（详见 [Part 4.2](#42-评测你自己-kernel-的-e2e-分数)，须用默认参数）
+> 2. **性能：E2E 分数 / 加速比**（详见 [Part 4.2](#42-评测你自己-kernel-的-e2e-分数)，须用默认参数）
 >    ```bash
->    python scripts/perf_test.py --input-len 100000 --output-len 64
+>    python scripts/perf_test.py --port 8004 --input-len 100000 --output-len 64
 >    ```
 >    截图须包含**你敲的这条命令**和输出里的 `E2E 评分`、`加速比`、以及最后一行 `[perf] SUMMARY ...`。
 >
 > 截图里必须能看到命令本身（证明用的是原始脚本和默认参数，未改动）。
 
-> **正确性是性能的前提**：正确性命令必须先 `ALL PASS`，性能分数才有效——否则近似/丢 KV 的 kernel（如 sparse attention）可以只刷速度而不保证结果正确。两项一起看，速度分才算数。
+> **正确性是性能的前提**：HumanEval pass@1 必须与 baseline 基本持平，性能分数才有效——否则近似/丢 KV 的 kernel（如 sparse attention）可以只刷速度而结果已错。两项一起看，速度分才算数。
 >
-> ⚠️ **正确性只以 [Part 3](#part-3分页注意力正确性检测) 的 `test_paged_attn_correctness.py` 为准**。教程里还有另外两个“验证”只是**辅助自检、不是评分依据**：Part 1.3 / 2.4 的**冒烟测试**（`smoke_test.py`，只问一道 `17+25` 看服务通不通）、Part 1.4 的 **HumanEval**（跑通演示用）。别拿这两个当正确性凭证。
+> 💡 另有一个**离线快速自检**可选用：[Part 3](#part-3分页注意力正确性检测) 的 `tests/test_paged_attn_correctness.py`（秒级、不用起服务，直接把你 kernel 输出和 PyTorch 参考逐元素比对）。开发调试时先用它排错很方便，但**最终提交的正确性凭证以 HumanEval pass@1 为准**。
 
 ---
 
@@ -162,6 +168,8 @@ PYTHONPATH=../vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32
 验证完可在启动终端按 `Ctrl-C` 停止服务，释放显存。
 
 ### 1.4 用 HumanEval 评测本服务（pass@1，贪心）
+
+> 📮 **这是最终提交的「正确性」凭证**：换上你自己的 kernel、起 CUSTOM 后端服务后跑本节流程，`pass@1` 应与 flash_attn baseline（`145/164 ≈ 88.41%`）基本持平即为正确。（本节先用默认 flash_attn 服务演示流程，测你自己的 kernel 时把 `--port` 换成你的 CUSTOM 服务端口即可。）
 
 用 **HumanEval**（164 道 Python 函数补全题）通过 OpenAI 兼容接口评测本服务，
 计算 `pass@1`（每题贪心解码只生成 1 个补全，要求它通过全部单测）。
@@ -340,7 +348,7 @@ Application startup complete.
 
 ### 2.4 验证正确性（仅冒烟自检，非评分）
 
-> 这里的冒烟测试只是**快速自检**：确认换上你的 kernel 后服务还能正常起、能算对一道简单题。**它不是正确性评分依据**——正式的正确性判定以 [Part 3](#part-3分页注意力正确性检测) 的 `test_paged_attn_correctness.py`（`ALL PASS`）为准。
+> 这里的冒烟测试只是**快速自检**：确认换上你的 kernel 后服务还能正常起、能算对一道简单题。**它不是正确性提交凭证**——最终提交的正确性以 [Part 1.4 的 HumanEval pass@1](#14-用-humaneval-评测本服务pass1贪心) 为准（离线快速排错可另用 [Part 3](#part-3分页注意力正确性检测) 单元测试）。
 
 在**第二个终端**跑同一个冒烟测试：
 
@@ -494,11 +502,9 @@ PYTHONPATH=../vllm_src python scripts/smoke_test.py --port 8000 --model qwen3-32
 
 Part 2 里的 Triton attention 直接**接收分页 KV cache（paged KV cache）作为输入**。我们把它当作 **baseline**：你实现自己的 kernel 后，用同一份测试就能方便地校验正确性——无需启动整个 32B 服务。
 
-> ✅ **这是正确性的唯一评判标准**（要提交的正确性截图就截这条命令的输出）。它直接把你 kernel 的输出与 PyTorch 参考实现**逐元素比对**，数值级精确、秒级、离线，`sparse` 等近似 kernel 在这里必然 FAIL。
+> 💡 **本测试用于快速自检（不是最终提交凭证）**：它直接把你 kernel 的输出与 PyTorch 参考实现**逐元素比对**，数值级精确、秒级、离线、`sparse` 等近似 kernel 在这里必然 FAIL。开发调试阶段用它排错最方便；**但最终提交的正确性凭证以 [Part 1.4 的 HumanEval pass@1](#14-用-humaneval-评测本服务pass1贪心) 为准**。
 >
-> 对比另外两个"验证"——它们**只是辅助，不能替代本测试**：
-> - **冒烟测试**（1.3 / 2.4，`smoke_test.py`）：只问一道 `17+25` 看服务通不通，1 道题、蒙对也算过，**只证明"服务能跑"，不证明"kernel 算对"**。
-> - **HumanEval**（1.4）：164 题 pass@1，是**教学演示**（展示后端算错时分数会崩），慢且依赖整个模型，**不作评分门槛**。
+> 另一个 **冒烟测试**（1.3 / 2.4，`smoke_test.py`）只问一道 `17+25` 看服务通不通、蒙对也算过，**只证明"服务能跑"，既不是自检也不是提交凭证**。
 
 ### 3.1 接口约定（你的 kernel 要满足的签名）
 
