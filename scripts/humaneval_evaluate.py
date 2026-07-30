@@ -16,6 +16,10 @@ humaneval_evaluate.py —— 在沙箱里执行 HumanEval 补全，计算 pass@1
     - 每题在**单独子进程**里跑，超时(默认 10s)即 SIGKILL，防死循环/挂起；
     - 子进程内通过 resource 限制 CPU 时间与地址空间（Linux 上生效），
       降低 fork 炸弹 / 内存爆炸的影响；
+    - OOM 兜底：worker 内捕获 MemoryError（rlimit 触发）仅判该题失败；SIGXCPU
+      转成超时判负，避免 CPU 超限直接杀死 worker；若 worker 仍被硬杀（如
+      内核 OOM killer 的 SIGKILL，BrokenProcessPool），未完成的题逐题重试
+      精确定位肇事题判 FAIL——一题内存爆炸/自毁不会拖垮整轮评测；
     - 关闭子进程对父进程内存的影响（独立解释器）。
   但这**不是**强隔离沙箱。生产/大规模评测请在容器或 gVisor/nsjail 等隔离环境中运行。
   这也是 README 里反复强调"务必在隔离环境中执行"的原因。
@@ -94,16 +98,33 @@ def _run_in_this_process(program: str, timeout_s: int,
         raise _Timeout()
 
     old = signal.signal(signal.SIGALRM, _on_alarm)
+    # SIGXCPU 兜底：RLIMIT_CPU 软限触发时默认动作是直接杀死进程（会拖垮
+    # ProcessPoolExecutor）。转成 _Timeout 让 worker 干净地判 FAIL 存活下来；
+    # 只有 handler 失效时的硬限（或 OOM killer 的 SIGKILL）才会真正杀死 worker。
+    old_xcpu = None
+    if hasattr(signal, "SIGXCPU"):
+        old_xcpu = signal.signal(signal.SIGXCPU, _on_alarm)
     signal.alarm(timeout_s)
     try:
         env = {"__name__": "__humaneval__"}
         exec(compile(program, "<candidate>", "exec"), env)
         return True
+    except MemoryError:
+        # OOM 兜底①：RLIMIT_AS 触发后 Python 抛 MemoryError。worker 进程本身
+        # 存活，仅判该题失败；gc 一下避免残留大对象污染同 worker 的后续任务。
+        import gc
+
+        gc.collect()
+        print("[eval] worker 捕获 MemoryError（内存超限），该题判 FAIL",
+              file=sys.stderr)
+        return False
     except BaseException:
         return False
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old)
+        if old_xcpu is not None:
+            signal.signal(signal.SIGXCPU, old_xcpu)
 
 
 def _worker(args) -> tuple:
@@ -167,7 +188,11 @@ def main() -> int:
     )
     ap.add_argument("--data", default=DEFAULT_DATA, help="HumanEval.jsonl.gz 路径")
     ap.add_argument("--timeout", type=int, default=10, help="单题执行超时（秒）")
-    ap.add_argument("--cpu-limit", type=int, default=10, help="子进程 CPU 秒数上限")
+    ap.add_argument(
+        "--cpu-limit", type=int, default=15,
+        help="子进程 CPU 秒数上限；应大于 --timeout，让 SIGALRM 先触发、"
+             "worker 得以存活判 FAIL 而不是被 SIGXCPU 直接杀死",
+    )
     ap.add_argument(
         "--mem-limit-mb", type=int, default=4096,
         help="子进程地址空间上限（MB），0=不限制",
@@ -210,24 +235,62 @@ def main() -> int:
         for s in samples
     ]
 
-    results = []  # (task_id, passed)
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=args.workers, mp_context=ctx
-    ) as ex:
-        for i, (tid, passed) in enumerate(ex.map(_worker, payloads), 1):
-            results.append((tid, passed))
-            mark = "PASS" if passed else "FAIL"
-            print(f"[eval] {i:>3}/{len(samples)}  {tid:<16} {mark}")
+    results: dict = {}  # task_id -> passed
+    from concurrent.futures.process import BrokenProcessPool
 
-    n_pass = sum(1 for _, ok in results if ok)
+    def _run_pool(idxs) -> set:
+        """用进程池跑 idxs 里的题，返回完成的下标集合。
+
+        worker 被硬杀（OOM killer / 资源超限 / 候选代码自毁）时 Pool 抛
+        BrokenProcessPool——已出结果的题保留，未完成的由调用方决定如何重试。
+        """
+        done = set()
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.workers, mp_context=ctx
+        ) as ex:
+            fut2idx = {ex.submit(_worker, payloads[i]): i for i in idxs}
+            try:
+                for fut in concurrent.futures.as_completed(fut2idx):
+                    i = fut2idx[fut]
+                    tid, passed = fut.result()
+                    results[tid] = passed
+                    done.add(i)
+                    mark = "PASS" if passed else "FAIL"
+                    print(f"[eval] {len(results):>3}/{len(samples)}  "
+                          f"{tid:<16} {mark}")
+            except BrokenProcessPool:
+                pass  # 由外层恢复逻辑处理
+        return done
+
+    # OOM 兜底②：先并行跑；若有题把 worker 跑死，对未完成者**逐题重试**——
+    # 单题池里崩溃能精确定位肇事题，直接判 FAIL 继续，不误伤同池其它题，
+    # 一道“内存炸弹/自毁”题不会拖垮整轮评测。
+    pending = list(range(len(payloads)))
+    done = _run_pool(pending)
+    leftover = [i for i in pending if i not in done]
+    if leftover:
+        print(f"[eval] 评测 worker 被杀（疑似 OOM killer / 资源超限），"
+              f"逐题重试 {len(leftover)} 题以定位肇事题", file=sys.stderr)
+    for i in leftover:
+        tid = payloads[i][0]
+        done = _run_pool([i])
+        if i not in done:
+            results[tid] = False
+            print(f"[eval] {len(results):>3}/{len(samples)}  {tid:<16} "
+                  f"FAIL (worker 被杀，疑似 OOM/资源超限)")
+
+    n_pass = sum(1 for ok in results.values() if ok)
     n_total = len(results)
     pass_at_1 = n_pass / n_total if n_total else 0.0
 
     if args.report:
         os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)
         with open(args.report, "w", encoding="utf-8") as f:
-            for tid, ok in results:
-                f.write(json.dumps({"task_id": tid, "passed": ok}) + "\n")
+            for s in samples:
+                tid = s["task_id"]
+                f.write(json.dumps(
+                    {"task_id": tid, "passed": bool(results.get(tid, False))}
+                ) + "\n")
         print(f"[eval] 逐题结果已写入 {args.report}")
 
     print("=" * 50)
