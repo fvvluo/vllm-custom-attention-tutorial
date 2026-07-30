@@ -362,3 +362,50 @@ baseline on its own. HumanEval was not scored (rules: only if score<147). No fab
 numbers. The fast-prefill hybrid is kept because it is correct and a genuine improvement
 (100K prefill now completes vs the prior unusable Triton stall), documented as not beating
 baseline.
+
+## Phase V4-R Final Diagnostic — service bottleneck located (config, not kernel/dispatch)
+
+Goal: find a service-level lever to drop the official score below 147.0 s. Result: the
+bottleneck is precisely attributed, but the fix is illegal under the grading rules.
+
+### Same-GPU A/B diagnostic (authoritative)
+One flash_attn baseline run on the SAME config (Qwen3-32B bf16, max_len 102400, util
+0.95, chunked prefill, YaRN, input 100000/output 64) — only `--attention-backend`
+differs (and baseline does NOT use `--enforce-eager`/`--no-async-scheduling`):
+| metric | baseline flash_attn (GPU6) | V4 CUSTOM (GPU3) | gap |
+|---|---:|---:|---:|
+| TTFT | 111.440 s | 153.620 s | +42.2 s |
+| TPOT | 35.54 ms | 47.42 ms | +11.9 ms |
+| **E2E score** | **146.979 s** (=official 147.0, 1.0001x) | **201.042 s** | +54 s |
+Baseline reproduced the official 147.0 s exactly → measurement validated.
+
+### BASELINE_V4_CONFIG_DIFF (sorted by impact)
+1. **CUDA Graph: baseline ON (FA3) vs V4 OFF** — HIGH (TPOT + per-step overhead).
+2. **enforce_eager: baseline NO vs V4 YES** — HIGH.
+3. **async_scheduling: baseline ON vs V4 OFF** — MED.
+All three stem from ONE cause: the CUSTOM backend declares `_cudagraph_support=NEVER`
+in `custom_triton_backend.py` (a **forbidden-to-edit** file), which forces
+`--enforce-eager` (no CUDA graphs) and the conservative scheduling. model/dtype/TP/
+max_len/util/chunked(8192)/block_size/kv_dtype/client/streaming/concurrency all match.
+
+### V3 hit evidence during the REAL 100K request (Checkpoint F2)
+Added low-overhead `num_seqs`-split counters (no in-timing sync/copy/logging). Serve log:
+`FIRST num_seqs=1 V3 decode HIT: num_seqs=1 ... max_seq_len=95699` → **the real 100K
+single-request decode DOES dispatch to V3** (not a fallback), no runtime-disable. So the
+slow service decode is NOT a dispatch bug — it is eager-mode per-layer/per-token Python+
+launch overhead (V3 runs, but 64 layers × per-token eager dispatch dominates TPOT).
+
+### One allowed config experiment: async scheduling ON
+Relaunched V4 with `--no-async-scheduling` removed (async ON confirmed in log), everything
+else identical. Same ~10s prefill burst then ~2.5-min near-idle window then client
+`RemoteProtocolError` — **async scheduling did NOT fix the stall/TTFT.** No improvement.
+
+### Conclusion
+The V4 score is dominated by TTFT. **V4 TTFT (153.6 s) alone exceeds the 147.0 s baseline**,
+and even the baseline's own TTFT is 111.4 s (76% of budget). The +42 s TTFT / +12 ms TPOT
+gap is caused by eager-mode/no-CUDA-graph, which is forced by the forbidden-file
+`_cudagraph_support=NEVER`. The only legal lever (async scheduling) did not help. Beating
+147 s is not achievable without editing a forbidden file or a fundamentally faster
+single-request 100K prefill — neither permitted. Recorded honestly as **FAIL**; the V3
+decode kernel works and is genuinely hit at 100K, but decode is not the service bottleneck.
+No scoring/baseline files modified; V2/V3 kernel diff = 0.

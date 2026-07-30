@@ -51,16 +51,27 @@ class _DispatchStats:
         self.hits = 0
         self.fallbacks = 0
         self.reason_counts = {}
+        self.ns1_hits = 0            # num_seqs==1 decode hits (real single-request)
+        self.ns_multi_hits = 0       # num_seqs>1 hits (profiling/batched)
         self._logged_first_hit = False
+        self._logged_first_ns1 = False
         self._logged_reasons = set()
         self._atexit_registered = False
 
     def _debug(self):
         return os.environ.get(_DEBUG_ENV, "0") == "1"
 
-    def record_hit(self, shape_stride_desc):
+    def record_hit(self, shape_stride_desc, num_seqs=None):
         with self._lock:
             self.hits += 1
+            if num_seqs == 1:
+                self.ns1_hits += 1
+                if not self._logged_first_ns1:
+                    self._logged_first_ns1 = True
+                    print(f"[v4-dispatch] FIRST num_seqs=1 V3 decode HIT: {shape_stride_desc}",
+                          flush=True)
+            elif num_seqs is not None:
+                self.ns_multi_hits += 1
             if not self._logged_first_hit:
                 self._logged_first_hit = True
                 print(f"[v4-dispatch] FIRST V3 decode HIT: {shape_stride_desc}",
@@ -84,7 +95,8 @@ class _DispatchStats:
     def report(self):
         # Printed once at process exit (or on explicit call).
         rc = ", ".join(f"{k}={v}" for k, v in sorted(self.reason_counts.items()))
-        print(f"[v4-dispatch] TOTALS: v3_hits={self.hits} fallbacks={self.fallbacks} "
+        print(f"[v4-dispatch] TOTALS: v3_hits={self.hits} (ns1={self.ns1_hits} "
+              f"ns_multi={self.ns_multi_hits}) fallbacks={self.fallbacks} "
               f"reasons[{rc}]", flush=True)
 
 
@@ -249,7 +261,8 @@ def try_v3_decode(
         f"num_seqs={num_seqs} q={tuple(query.shape)}/{query.stride()} "
         f"kc={tuple(key_cache.shape)}/{key_cache.stride()} "
         f"out={tuple(output_view.shape)}/{output_view.stride()} "
-        f"split={_SPLIT_SIZE_TOKENS} max_seq_len={int(max_seq_len)}"
+        f"split={_SPLIT_SIZE_TOKENS} max_seq_len={int(max_seq_len)}",
+        num_seqs=num_seqs,
     )
     return True
 
