@@ -71,16 +71,25 @@ export PYTHONPATH="/dockerdata/liuxiaochen/vllm_src:${TUTORIAL_DIR}:${PYTHONPATH
 export LIUXIAOCHEN_PAGED_DECODE_V3=1
 unset LIUXIAOCHEN_PAGED_DECODE_V3_DEBUG   # keep only FIRST hit / first fallback / totals
 
+# CUDA graphs: dropping --enforce-eager lets vLLM run torch.compile + PIECEWISE CUDA
+# graphs (auto-downgraded from FULL_AND_PIECEWISE because CustomTritonBackend declares
+# AttentionCGSupport.NEVER — attention runs eagerly at split points, non-attention layers
+# are graph-captured). Matches the baseline's non-eager config. Set ENFORCE_EAGER=1 to
+# force the old eager path. async scheduling left at vLLM default (ON, like baseline).
+ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
+EAGER_ARGS=()
+[ "${ENFORCE_EAGER}" = "1" ] && EAGER_ARGS+=(--enforce-eager --no-async-scheduling)
+
 SERVE_CMD="/usr/bin/python -m vllm.entrypoints.openai.api_server \
   --model ${MODEL} --served-model-name qwen3-32b --port ${PORT} \
   --gpu-memory-utilization ${GPU_MEM_UTIL} --max-model-len ${MAX_LEN} \
-  --enforce-eager --no-async-scheduling --attention-backend CUSTOM \
+  ${EAGER_ARGS[*]} --attention-backend CUSTOM \
   --hf-overrides ${HF_OVERRIDES}"
 echo "[eval] SERVE CMD: CUDA_VISIBLE_DEVICES=${GPU_ID} LIUXIAOCHEN_PAGED_DECODE_V3=1 ${SERVE_CMD}" | tee "${SERVE_LOG}"
 /usr/bin/python -m vllm.entrypoints.openai.api_server \
   --model "${MODEL}" --served-model-name qwen3-32b --port "${PORT}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL}" --max-model-len "${MAX_LEN}" \
-  --enforce-eager --no-async-scheduling --attention-backend CUSTOM \
+  "${EAGER_ARGS[@]}" --attention-backend CUSTOM \
   --hf-overrides "${HF_OVERRIDES}" >> "${SERVE_LOG}" 2>&1 &
 SERVER_PID=$!
 echo "[eval] service PID=${SERVER_PID} log=${SERVE_LOG}"

@@ -409,3 +409,51 @@ gap is caused by eager-mode/no-CUDA-graph, which is forced by the forbidden-file
 single-request 100K prefill — neither permitted. Recorded honestly as **FAIL**; the V3
 decode kernel works and is genuinely hit at 100K, but decode is not the service bottleneck.
 No scoring/baseline files modified; V2/V3 kernel diff = 0.
+
+## Phase V4 CUDA-Graph Sprint — graphs ENABLED (PIECEWISE), but 100K score still FAIL
+
+### CUDA-graph contract (Checkpoint G1, vLLM a49d37c6b)
+`AttentionCGSupport` = {NEVER=0, UNIFORM_SINGLE_TOKEN_DECODE=1, UNIFORM_BATCH=2,
+ALWAYS=3}; overridden via `_cudagraph_support` on the builder. flash_attn=ALWAYS(FA3),
+triton=ALWAYS. Global policy = `CUDAGraphMode` {NONE/PIECEWISE/FULL/FULL_AND_PIECEWISE}.
+**Key fact: PIECEWISE captures the NON-attention layers into graphs and runs attention
+eagerly at split points; it works even with backend `_cudagraph_support=NEVER`.** So the
+only reason V4 had no graphs was `--enforce-eager` forcing `cudagraph_mode=NONE`.
+
+### Minimal enablement (NO code change, NO forbidden-file edit, NO V3 graph-safety)
+Launched the existing CUSTOM backend WITHOUT `--enforce-eager` (torch.compile ON,
+`cudagraph_mode=FULL_AND_PIECEWISE`). vLLM auto-downgraded to **PIECEWISE** for CUSTOM
+(`compilation.py:1423`: "not supported with CustomTritonBackend ... setting
+cudagraph_mode=PIECEWISE"). **51 PIECEWISE graphs captured successfully**; startup
+complete; 42 smoke PASS; V3 `FIRST num_seqs=1 decode HIT` confirmed (attention still runs
+eagerly under PIECEWISE); no runtime-disable; no stale output.
+
+### Results (Checkpoint G4/G5), physical GPU 3
+| config | 8K TPOT | 100K TTFT | 100K TPOT | 100K score |
+|---|---:|---:|---:|---:|
+| baseline flash_attn | — | 111.4s | 35.5ms | 147.0s |
+| V4 eager (prior) | — | 153.6s | 47.4ms | 201.0s |
+| **V4 PIECEWISE graph** | **36.9ms** (was 47.4) | **153.55s** | **45.78ms** | **199.33s** |
+- PIECEWISE graphs cut **8K** TPOT 47.4→36.9ms (near baseline 35.5) — graph capture is
+  real and helps the short-context per-layer overhead.
+- BUT **100K TTFT stayed 153.5s** (+42s over baseline) and 100K TPOT only 47.4→45.8ms.
+  Score 199.3s > 147.0 → **0.7375x, FAIL**. 3/3 runs consistent (153.4/153.7/153.6s).
+
+### Why graphs didn't fix the 100K score (Checkpoint G5 analysis)
+Serve-log timeline of each 100K request: ~10s prefill burst (FA hybrid, 9569 tok/s) then
+a **~2.5-min window at `generation throughput ~2.4 tok/s`, `Running: 1 req`, KV 15.8%**.
+That stall = the 153s TTFT, and it is in the **eager attention path during the long
+single-request 100K processing**, which PIECEWISE leaves OUTSIDE the graph. PIECEWISE only
+graph-captures the non-attention layers (helps 8K where those dominate); at 100K the cost
+is the eager per-token/per-chunk attention over 95k KV, unaffected by PIECEWISE. Putting
+attention INSIDE a FULL-decode graph would need `_cudagraph_support>=UNIFORM_SINGLE_TOKEN_
+DECODE` AND a fully graph-safe V3 (static addresses) — and even then TTFT (153s) alone
+exceeds the 147s baseline, so it cannot win.
+
+### Verdict: PERF_FAIL
+CUDA graphs are correctly enabled (PIECEWISE, 51 graphs, validated: capture/replay OK,
+42 PASS, V3 hits, no stale/disable) — P0 and P1 achieved. But the official 100K score
+199.3s > 147.0 (P2 not met). The gap is the single-request 100K eager-attention TTFT, not
+graphable. No fabricated win. V2/V3 kernel diff=0; perf_test/baseline/scoring untouched.
+Enablement is a pure launch-config change (drop `--enforce-eager`); recorded in
+run_final_v4_evaluation.sh for reproducibility.
