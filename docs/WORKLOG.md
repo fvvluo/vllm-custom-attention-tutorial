@@ -273,3 +273,46 @@ reroute only the READ to V3 when supported). Feature flag
 - Min-viable BF16 (from prior successful serve log): weights+non-torch ≈ 61.9 GiB,
   peak activation ≈ 1.48 GiB; needs startup free ≈ util×95 GiB. util 0.78 ⇒ ~74 GiB
   free needed, leaving ~10 GiB KV (~40k tokens) — ample for an 8192-len smoke.
+
+## Phase V4-R Final Sprint — legal refactor + live service (official 100K NOT completed)
+
+### Submission-legal refactor (obey official README hard rule)
+The official README (origin/main) states the ONLY pre-existing file we may modify is
+`custom_backend/triton_attention.py`. The earlier V4 edited `custom_triton_backend.py`
+(forbidden). Refactor: **reverted `custom_triton_backend.py` to pristine (002b805)**;
+moved the V3 dispatch INTO `paged_attention_triton(...)` in `triton_attention.py` (legal
+file). Pure-decode is now detected from the live tensors (num_tokens==num_seqs and
+query_start_loc==[0,1,...,N]); `max_seq_len` derived from `seq_lens.max()` on the decode
+path only. New adapter entry `try_v3_decode_from_triton_args`. Re-ran the real
+backend-forward gate: **24/24 PASS, EXIT_CODE=0** (`logs/v4_backend_forward_legal_gpu0.log`,
+GPU 0) — forward hits V3, bit-identical to direct V3, prefill/fp16 fall back.
+
+### Live Qwen3-32B V4 service — READY + smoke PASS + V3 dispatch CONFIRMED (GPU 5, UUID 6afcc978)
+`scripts/run_final_v4_evaluation.sh` (new), YaRN HF_OVERRIDES (factor 4.0), MAX_LEN 102400,
+gpu-memory-utilization 0.95, `--attention-backend CUSTOM`, `LIUXIAOCHEN_PAGED_DECODE_V3=1`.
+- Engine init clean: KV cache 26.84 GiB / 109,952 tokens; **Application startup complete**.
+- **Smoke 42 = PASS**; 64-token generation PASS (req1=77, req2=44 tokens, coherent).
+- **FIRST V3 decode HIT confirmed** in serve log; **Prefill fallback confirmed**
+  (`not_pure_decode(num_tokens!=num_seqs)`). No OOM/CUDA-error/runtime-disable at smoke.
+
+### Official 100K E2E — NOT COMPLETED (perf exit=1)
+The official `perf_test.py` (input 100000 / output 64) **warmup request dropped**:
+`RemoteProtocolError: peer closed connection without sending complete message body`.
+Actual tokenized input ~95,653. No valid V4 E2E was produced → cannot compare against the
+official baseline (147.0 s = flash_attn, single H20, `E2E = TTFT + 1000×TPOT`). Root
+architectural cause: the CUSTOM backend keeps the teaching **Triton prefill**, which the
+repo itself notes cannot practically run 100K; the long prefill stalled/reset the stream.
+V3 only accelerates DECODE; the score adds TTFT linearly, so a slow 100K prefill dominates.
+
+### HumanEval — 0/164 via harness (NOT a valid correctness credential)
+`humaneval_generate.py` returned `    pass\n` for every task → pass@1 = 0/164. This is a
+generation-harness/prompt-format artifact (the SAME live service answered "42" and wrote
+coherent poems correctly), NOT V3 kernel garbage — but without a real pass@1 we do NOT
+claim correctness. HumanEval remains PENDING.
+
+### Verdict
+V4 code path fully validated offline (synthetic 37/37, backend-forward 24/24) AND live
+(service ready, 42, V3 decode HIT, prefill fallback). The OFFICIAL 100K E2E and HumanEval
+pass@1 were NOT completed (100K prefill stream reset + HumanEval harness returned stubs).
+Therefore the final performance claim is **NOT PASS** — recorded honestly, no fabricated
+speedup. The 13.1x is a decode-kernel microbenchmark and is NOT a service-level result.

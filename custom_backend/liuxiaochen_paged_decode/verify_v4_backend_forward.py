@@ -2,16 +2,17 @@
 """V4 real backend-forward gate (Liu Xiaochen).
 
 Exercises the REAL `CustomTritonImpl.forward` path — real metadata, real KV-cache
-WRITE (`triton_reshape_and_cache_flash`), real read dispatch (V3 adapter or Triton
-fallback) — WITHOUT loading Qwen3-32B. This is stronger than verify_v4_adapter.py,
-which drove `try_v3_decode` directly.
+WRITE (`triton_reshape_and_cache_flash`), real read via the PRISTINE
+`paged_attention_triton(...)` whose body now dispatches to V3 for supported pure
+decode (the only project file grading lets us edit) — WITHOUT loading Qwen3-32B.
+This is stronger than verify_v4_adapter.py, which drove `try_v3_decode` directly.
 
 REAL vs FIXTURE boundary:
-  REAL:   CustomTritonImpl (normal __init__), CustomTritonMetadata, the forward()
-          method itself, the packed KV-cache `(num_blocks,Hkv,BS,2*hs)`, block_table,
-          slot_mapping, seq_lens, query_start_loc, max_query_len/max_seq_len, the
-          KV-cache write, the V3-vs-Triton dispatch, and the output buffer contract
-          `[num_tokens, num_heads*head_size]`.
+  REAL:   CustomTritonImpl (normal __init__), CustomTritonMetadata (pristine — no
+          added fields), the forward() method itself, the packed KV-cache
+          `(num_blocks,Hkv,BS,2*hs)`, block_table, slot_mapping, seq_lens,
+          query_start_loc, the KV-cache write, the in-`paged_attention_triton` V3-vs-
+          Triton dispatch (decode detected from tensors), and the output contract.
   FIXTURE: a tiny `_Layer` object exposing only `_k_scale`/`_v_scale` (= 1.0), which
           is all `forward` reads from `layer`; and hand-built paged tensors standing
           in for what vLLM's model runner would supply. No vLLM engine/model/runner.
@@ -120,7 +121,7 @@ def build_decode(seq_lens, device, seed, dtype=torch.bfloat16, shuffle=True, pre
     md = CustomTritonMetadata(
         num_actual_tokens=len(seq_lens), query_start_loc=qsl, seq_lens=seq_lens_t,
         block_table=block_table, slot_mapping=slot_mapping, token_seq_idx=tsi,
-        causal=True, max_query_len=1, max_seq_len=max(seq_lens))
+        causal=True)
     return dict(kv=kv, query=query, key=cur_k, value=cur_v, packed=packed,
                 key_cache=key_cache, value_cache=value_cache, block_table=block_table,
                 md=md, seq_lens=seq_lens, num_tokens=len(seq_lens), qsl=qsl,
@@ -224,7 +225,7 @@ def main():
     md = CustomTritonMetadata(num_actual_tokens=sl, query_start_loc=qsl,
                               seq_lens=torch.tensor([sl], device=dev, dtype=torch.int32),
                               block_table=bt, slot_mapping=torch.tensor(slot_map, device=dev, dtype=torch.int64),
-                              token_seq_idx=tsi, causal=True, max_query_len=sl, max_seq_len=sl)
+                              token_seq_idx=tsi, causal=True)
     dP = dict(query=q_full, key=k_full, value=v_full, packed=packed, num_tokens=sl, md=md)
     # causal reference
     refP = torch.empty(sl, QH, D, dtype=torch.float32, device=dev)

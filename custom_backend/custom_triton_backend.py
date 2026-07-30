@@ -56,11 +56,6 @@ class CustomTritonMetadata:
     slot_mapping: torch.Tensor      # [num_actual_tokens]
     token_seq_idx: torch.Tensor     # [num_actual_tokens] 每 token 属于哪条请求
     causal: bool | torch.Tensor
-    # Scalars carried through for V4 dispatch (both are CPU ints precomputed by
-    # the runner — reading them causes NO host<->device sync). max_query_len==1
-    # is the pure-decode test; max_seq_len sizes the V3 split.
-    max_query_len: int = 1
-    max_seq_len: int = 0
 
 
 # ============================================================================
@@ -106,8 +101,6 @@ class CustomTritonMetadataBuilder(AttentionMetadataBuilder[CustomTritonMetadata]
             slot_mapping=common_attn_metadata.slot_mapping,
             token_seq_idx=token_seq_idx,
             causal=common_attn_metadata.causal,
-            max_query_len=common_attn_metadata.max_query_len,
-            max_seq_len=common_attn_metadata.max_seq_len,
         )
 
 
@@ -246,43 +239,15 @@ class CustomTritonImpl(AttentionImpl):
         # 的写入位置一致。
         # output 传成 [num_tokens, num_heads, head_size] 视图供原地写入。
         out_view = output[:num_actual_tokens].view(-1, self.num_heads, hs)
-
-        # ---- V4 dispatch: strictly-supported pure decode -> V3 cp.async kernel ----
-        # Only the READ (attention) is rerouted; the KV-cache WRITE above always
-        # runs. V3 reads the live key_cache/value_cache split views, block_table,
-        # seq_lens and current stream in place (no clone/contiguous/gather/copy).
-        # Anything outside the support domain (prefill, mixed, wrong shape/dtype/
-        # alignment, flag off) returns False and we keep the Triton path below.
-        from .liuxiaochen_paged_decode.vllm_adapter_v4 import try_v3_decode
-
-        used_v3 = try_v3_decode(
+        paged_attention_triton(
             query=query[:num_actual_tokens],
             key_cache=key_cache,
             value_cache=value_cache,
-            output_view=out_view,
+            output=out_view,
             query_start_loc=attn_metadata.query_start_loc,
             seq_lens=attn_metadata.seq_lens,
             token_seq_idx=attn_metadata.token_seq_idx,
             block_table=attn_metadata.block_table,
             scale=self.scale,
-            max_seq_len=attn_metadata.max_seq_len,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_size=hs,
-            num_actual_tokens=num_actual_tokens,
-            max_query_len=attn_metadata.max_query_len,
-            causal=attn_metadata.causal,
         )
-        if not used_v3:
-            paged_attention_triton(
-                query=query[:num_actual_tokens],
-                key_cache=key_cache,
-                value_cache=value_cache,
-                output=out_view,
-                query_start_loc=attn_metadata.query_start_loc,
-                seq_lens=attn_metadata.seq_lens,
-                token_seq_idx=attn_metadata.token_seq_idx,
-                block_table=attn_metadata.block_table,
-                scale=self.scale,
-            )
         return output
