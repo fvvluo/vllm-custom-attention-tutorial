@@ -316,3 +316,49 @@ V4 code path fully validated offline (synthetic 37/37, backend-forward 24/24) AN
 pass@1 were NOT completed (100K prefill stream reset + HumanEval harness returned stubs).
 Therefore the final performance claim is **NOT PASS** — recorded honestly, no fabricated
 speedup. The 13.1x is a decode-kernel microbenchmark and is NOT a service-level result.
+
+## Phase V4-R Final Rescue — VALID official 100K result obtained (FAIL: 201.0s > 147.0s)
+
+### 100K reset root cause (Checkpoint R1): A. SERVER_ALIVE_CLIENT_RESET + glacial Triton prefill
+Prior run's serve log ended idle with NO error/OOM/CUDA/crash (only the cleanup
+resource_tracker warning); the same server then answered all 164 HumanEval requests →
+server never died. The real blocker was prompt throughput **2.4–5.1 tok/s** on the
+teaching Triton prefill → ~95,653-token prefill ≈ 8+ h → client `RemoteProtocolError`.
+Chunked prefill was ALREADY on (`max_num_batched_tokens=8192`) and did not help.
+dmesg Xid faults were all foreign PIDs. So the Triton prefill is unusable at 100K, but
+this was NOT a kernel crash.
+
+### Legal fast-prefill hybrid (Checkpoint R2)
+Per the official README, only `triton_attention.py` is editable but NEW files + imports
+called inside `paged_attention_triton` are allowed. Added `vllm_prefill_fa.py`: the
+prefill/mixed path now calls vLLM's own paged FlashAttention (`flash_attn_varlen_func`
+with `block_table=`) on the SAME packed KV-cache (K/V half-views transposed HND→NHD, a
+view, no copy/gather). Architecture: **Prefill→paged FlashAttention, Decode→V3,
+else→Triton**. Synthetic gate `verify_fa_prefill.py`: **6/6 PASS** (vs PyTorch ref ≤1e-2).
+
+### Official 100K + 64 (Checkpoint R4) — VALID, 3/3 runs, physical GPU 3 (UUID 703ca4fb)
+`logs/v4_final_perf_gpu3_20260730_105800.log`, perf exit=0, official defaults
+(input 100000→~95,653 tokens, output 64, baseline 147.0):
+| run | TTFT (s) | decode tok/s |
+|---|---:|---:|
+| 1 | 153.620 | 21.2 |
+| 2 | 153.833 | 21.0 |
+| 3 | 153.473 | 21.1 |
+- median TTFT = **153.620 s**, TPOT = **47.42 ms/tok**, decode 21.1 tok/s.
+- **E2E score = TTFT + 1000×TPOT = 201.042 s**; baseline 147.0 → **speedup 0.7312x (SLOWER)**.
+- Live smoke PASS (42, 64-token gen); V3 decode HIT + prefill fallback confirmed; no
+  OOM/CUDA-error/runtime-disable; server stayed alive; no GPU contention on GPU 3.
+- FA prefill compute is actually fast (serve log burst `prompt throughput 9569.6 tok/s`),
+  but single-request 100K TTFT is still ~153 s end-to-end (chunked-prefill scheduling +
+  client tokenization of the 95k prompt), and **TTFT alone (153.6 s) already exceeds the
+  147 s baseline** — since the score adds TTFT linearly, no decode speedup (even perfect
+  0 ms) can win. TPOT 47 ms also indicates decode is not V3-dominated at this scale.
+
+### Verdict: FAIL (valid official test completed)
+V4 produced a **valid, honest official 100K E2E = 201.0 s**, which is **> 147.0 s**, so
+the performance target is NOT met. The decode kernel's 13.1x microbenchmark does NOT
+translate to a service win because 100K prefill TTFT dominates the score and exceeds the
+baseline on its own. HumanEval was not scored (rules: only if score<147). No fabricated
+numbers. The fast-prefill hybrid is kept because it is correct and a genuine improvement
+(100K prefill now completes vs the prior unusable Triton stall), documented as not beating
+baseline.

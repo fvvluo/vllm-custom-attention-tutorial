@@ -168,6 +168,22 @@ def paged_attention_triton(
         # Never let dispatch bookkeeping break the reliable Triton path.
         pass
 
+    # ---- V4 optional FAST PREFILL: reuse vLLM paged FlashAttention for the
+    # prefill/mixed path (the teaching Triton prefill is ~few tok/s at 100K).
+    # Reads the same packed paged KV cache in place; falls back to Triton on any
+    # issue. Decode already returned above; this only affects non-pure-decode. ----
+    try:
+        from .liuxiaochen_paged_decode.vllm_prefill_fa import try_fast_paged_prefill
+
+        if try_fast_paged_prefill(
+            query=query, key_cache=key_cache, value_cache=value_cache, output=output,
+            query_start_loc=query_start_loc, seq_lens=seq_lens,
+            block_table=block_table, scale=scale,
+        ):
+            return output
+    except Exception:
+        pass
+
     grid = (num_tokens, num_heads)
     _paged_attn_kernel[grid](
         output,
